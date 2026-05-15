@@ -1,21 +1,29 @@
-# BreezeVterm
+# Breeze VTerm
 
-**TODO: Add description**
+Virtual terminal components for Breeze applications.
 
-## Installation
+## Running the Example
 
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `breeze_vterm` to your list of dependencies in `mix.exs`:
+Fetch dependencies, then run the bundled example:
 
-```elixir
-def deps do
-  [
-    {:breeze_vterm, "~> 0.1.0"}
-  ]
-end
+```sh
+mix deps.get
+mix run examples/vterm.exs
 ```
 
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/breeze_vterm>.
+The example opens a Breeze UI with a console list on the left and a local
+PTY-backed shell on the right. Use the console list to switch focus between
+hosts. When the shell is focused, regular input goes to the shell.
 
+Useful keys:
+
+- `F10` quits the example.
+- `PageUp` and `PageDown` scroll the terminal buffer.
+- Breeze handles `Ctrl-C` and `Tab` only when the focused shell prompt is
+  empty. `Ctrl-C` quits the app in that state, and `Tab` changes Breeze focus.
+- When the prompt is not empty, or a command is running, `Ctrl-C` and `Tab` are
+  sent to the shell instead.
+
+The local shell transport uses the system `script` executable to create a PTY.
+If the example cannot start a local shell, make sure `script` is installed and
+available on `PATH`.
