@@ -18,7 +18,7 @@ defmodule Breeze.VTerm.SurfaceTest do
       |> Surface.write("abcdEFGHI")
 
     assert Surface.lines(surface) == ["EFGH", "I   "]
-    assert length(surface.scrollback) == 1
+    assert Surface.scrollback_rows(surface) == 1
   end
 
   test "virtual text exposes scrollback before the visible screen" do
@@ -36,6 +36,23 @@ defmodule Breeze.VTerm.SurfaceTest do
              [{"EFGH", %{}}],
              [{"I   ", %{}}]
            ] = virtual_text.slice_fn.(0, 3, 4)
+  end
+
+  test "scrollback can be capped" do
+    surface =
+      Surface.new(cols: 8, rows: 1, scrollback_limit: 2)
+      |> Surface.write("one\r\ntwo\r\nthree\r\nfour")
+
+    virtual_text = Surface.virtual_text(surface)
+
+    assert Surface.scrollback_rows(surface) == 2
+    assert Surface.line_count(surface) == 3
+
+    assert [
+             [{"two     ", %{}}],
+             [{"three   ", %{}}],
+             [{"four    ", %{}}]
+           ] = virtual_text.slice_fn.(0, 3, 8)
   end
 
   test "virtual text clips rows to the requested viewport width" do

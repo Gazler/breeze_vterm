@@ -10,17 +10,21 @@ defmodule Breeze.VTerm.Surface do
   alias BackBreeze.Ucwidth
   alias BackBreeze.VirtualText
 
-  defstruct cols: 80,
+  defstruct id: nil,
+            cols: 80,
             rows: 24,
+            scrollback_limit: 10_000,
             cursor: %{row: 0, col: 0},
             style: %{},
             screen: [],
-            scrollback: [],
+            scrollback: {[], []},
+            scrollback_count: 0,
             buffer: "",
             saved_cursor: nil,
             saved_screen_cursor: nil,
             saved_screen: nil,
             saved_scrollback: nil,
+            saved_scrollback_count: 0,
             saved_style: nil,
             alt_screen?: false,
             version: 0
@@ -34,34 +38,53 @@ defmodule Breeze.VTerm.Surface do
           optional(:reverse) => boolean()
         }
   @type cell :: %{text: String.t(), style: style()}
+  @type row :: [cell()]
   @type t :: %__MODULE__{
+          id: reference(),
           cols: pos_integer(),
           rows: pos_integer(),
+          scrollback_limit: non_neg_integer() | :infinity,
           cursor: %{row: non_neg_integer(), col: non_neg_integer()},
           style: style(),
-          screen: [[cell()]],
-          scrollback: [[cell()]],
+          screen: [row()],
+          scrollback: :queue.queue(row()),
+          scrollback_count: non_neg_integer(),
           buffer: binary(),
           saved_cursor: %{row: non_neg_integer(), col: non_neg_integer()} | nil,
           saved_screen_cursor: %{row: non_neg_integer(), col: non_neg_integer()} | nil,
-          saved_screen: [[cell()]] | nil,
-          saved_scrollback: [[cell()]] | nil,
+          saved_screen: [row()] | nil,
+          saved_scrollback: :queue.queue(row()) | nil,
+          saved_scrollback_count: non_neg_integer(),
           saved_style: style() | nil,
           alt_screen?: boolean(),
           version: non_neg_integer()
         }
 
   @ansi_8_color_count 8
+  @default_scrollback_limit 10_000
 
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     cols = positive_int(Keyword.get(opts, :cols, Keyword.get(opts, :columns, 80)), 80)
     rows = positive_int(Keyword.get(opts, :rows, 24), 24)
 
+    scrollback_limit =
+      scrollback_limit(
+        Keyword.get(
+          opts,
+          :scrollback_limit,
+          Keyword.get(opts, :max_scrollback_rows, @default_scrollback_limit)
+        )
+      )
+
     %__MODULE__{
+      id: make_ref(),
       cols: cols,
       rows: rows,
+      scrollback_limit: scrollback_limit,
       screen: blank_screen(cols, rows),
+      scrollback: :queue.new(),
+      scrollback_count: 0,
       cursor: %{row: 0, col: 0}
     }
   end
@@ -152,8 +175,8 @@ defmodule Breeze.VTerm.Surface do
   def virtual_text(%__MODULE__{} = surface) do
     VirtualText.lazy(
       cache_key:
-        {:breeze_terminal_surface, surface.version, surface.cols, surface.rows,
-         :erlang.phash2(surface.scrollback), :erlang.phash2(surface.screen)},
+        {:breeze_terminal_surface, surface.id, surface.version, surface.cols, surface.rows},
+      cache?: false,
       intrinsic_width: surface.cols,
       line_count_fn: fn _width -> line_count(surface) end,
       slice_fn: fn start_line, count, width ->
@@ -166,7 +189,7 @@ defmodule Breeze.VTerm.Surface do
   def line_count(%__MODULE__{} = surface), do: scrollback_rows(surface) + surface.rows
 
   @spec scrollback_rows(t()) :: non_neg_integer()
-  def scrollback_rows(%__MODULE__{} = surface), do: length(surface.scrollback)
+  def scrollback_rows(%__MODULE__{} = surface), do: surface.scrollback_count
 
   @spec slice(t(), non_neg_integer(), non_neg_integer()) :: [list({String.t(), style()})]
   def slice(%__MODULE__{} = surface, start_line, count) do
@@ -187,11 +210,40 @@ defmodule Breeze.VTerm.Surface do
   defp content_slice(surface, start_line, count, width) do
     width = clamp(width || surface.cols, 0, surface.cols)
 
-    surface.scrollback
-    |> Kernel.++(surface.screen)
-    |> Enum.slice(start_line, count)
+    surface
+    |> rows_slice(start_line, count)
     |> Enum.map(&Enum.take(&1, width))
     |> Enum.map(&row_segments/1)
+  end
+
+  defp rows_slice(_surface, _start_line, count) when count <= 0, do: []
+
+  defp rows_slice(surface, start_line, count) do
+    start_line = max(start_line, 0)
+    scrollback_count = surface.scrollback_count
+
+    cond do
+      start_line >= scrollback_count ->
+        Enum.slice(surface.screen, start_line - scrollback_count, count)
+
+      start_line + count <= scrollback_count ->
+        queue_slice(surface.scrollback, start_line, count)
+
+      true ->
+        scrollback_rows =
+          queue_slice(surface.scrollback, start_line, scrollback_count - start_line)
+
+        screen_rows = Enum.slice(surface.screen, 0, count - length(scrollback_rows))
+        scrollback_rows ++ screen_rows
+    end
+  end
+
+  defp queue_slice(_queue, start, count) when count <= 0 or start < 0, do: []
+
+  defp queue_slice(queue, start, count) do
+    {_before, rest} = :queue.split(start, queue)
+    {slice, _after} = :queue.split(count, rest)
+    :queue.to_list(slice)
   end
 
   defp consume(surface, ""), do: {surface, ""}
@@ -257,6 +309,14 @@ defmodule Breeze.VTerm.Surface do
     consume(surface, rest)
   end
 
+  defp consume(surface, <<char, _rest::binary>> = bytes) when char in 0x20..0x7E do
+    {run, rest} = take_printable_ascii(bytes)
+
+    surface
+    |> put_ascii_run(run)
+    |> consume(rest)
+  end
+
   defp consume(surface, bytes) do
     case next_grapheme(bytes) do
       {:ok, grapheme, rest} ->
@@ -275,6 +335,19 @@ defmodule Breeze.VTerm.Surface do
   defp take_csi(bytes), do: do_take_csi(bytes, [])
 
   defp take_osc(bytes), do: do_take_osc(bytes)
+
+  defp take_printable_ascii(bytes), do: do_take_printable_ascii(bytes, bytes, 0)
+
+  defp do_take_printable_ascii(original, <<char, rest::binary>>, count)
+       when char in 0x20..0x7E,
+       do: do_take_printable_ascii(original, rest, count + 1)
+
+  defp do_take_printable_ascii(_original, rest, 0), do: {"", rest}
+
+  defp do_take_printable_ascii(original, rest, count) do
+    <<run::binary-size(count), _remaining::binary>> = original
+    {run, rest}
+  end
 
   defp do_take_osc(""), do: :incomplete
   defp do_take_osc(<<?\a, rest::binary>>), do: {:ok, rest}
@@ -332,7 +405,7 @@ defmodule Breeze.VTerm.Surface do
     case csi_param(csi_params(params), 0, 0) do
       1 -> clear_to_cursor(surface)
       2 -> %{surface | screen: blank_screen(surface.cols, surface.rows)}
-      3 -> %{surface | scrollback: []}
+      3 -> %{surface | scrollback: :queue.new(), scrollback_count: 0}
       _ -> clear_from_cursor(surface)
     end
   end
@@ -479,10 +552,12 @@ defmodule Breeze.VTerm.Surface do
         saved_screen_cursor: surface.cursor,
         saved_screen: surface.screen,
         saved_scrollback: surface.scrollback,
+        saved_scrollback_count: surface.scrollback_count,
         saved_style: surface.style,
         cursor: %{row: 0, col: 0},
         screen: blank_screen(surface.cols, surface.rows),
-        scrollback: []
+        scrollback: :queue.new(),
+        scrollback_count: 0
     }
   end
 
@@ -494,11 +569,13 @@ defmodule Breeze.VTerm.Surface do
       | alt_screen?: false,
         cursor: surface.saved_screen_cursor || %{row: 0, col: 0},
         screen: surface.saved_screen || blank_screen(surface.cols, surface.rows),
-        scrollback: surface.saved_scrollback || [],
+        scrollback: surface.saved_scrollback || :queue.new(),
+        scrollback_count: surface.saved_scrollback_count || 0,
         style: surface.saved_style || %{},
         saved_screen_cursor: nil,
         saved_screen: nil,
         saved_scrollback: nil,
+        saved_scrollback_count: 0,
         saved_style: nil
     }
   end
@@ -530,6 +607,38 @@ defmodule Breeze.VTerm.Surface do
     put_cursor_col(surface, surface.cursor.col + width)
   end
 
+  defp put_ascii_run(surface, ""), do: surface
+
+  defp put_ascii_run(surface, bytes) do
+    cond do
+      surface.cursor.col >= surface.cols ->
+        surface
+        |> put_cursor_col(0)
+        |> linefeed()
+        |> put_ascii_run(bytes)
+
+      true ->
+        available = surface.cols - surface.cursor.col
+        take = min(byte_size(bytes), available)
+        <<chunk::binary-size(take), rest::binary>> = bytes
+        cells = ascii_cells(chunk, surface.style)
+
+        surface =
+          surface
+          |> put_cells(surface.cursor.row, surface.cursor.col, cells, take)
+          |> put_cursor_col(surface.cursor.col + take)
+
+        if rest == "" do
+          surface
+        else
+          surface
+          |> put_cursor_col(0)
+          |> linefeed()
+          |> put_ascii_run(rest)
+        end
+    end
+  end
+
   defp fill_wide_continuation(surface, width) when width <= 1, do: surface
 
   defp fill_wide_continuation(surface, width) do
@@ -549,6 +658,13 @@ defmodule Breeze.VTerm.Surface do
     put_row(surface, row, List.replace_at(current_row, col, cell))
   end
 
+  defp put_cells(surface, row, col, cells, count) do
+    current_row = Enum.at(surface.screen, row, blank_row(surface.cols))
+    {prefix, rest} = Enum.split(current_row, col)
+    {_replaced, suffix} = Enum.split(rest, count)
+    put_row(surface, row, prefix ++ cells ++ suffix)
+  end
+
   defp put_row(surface, row, cells) do
     %{surface | screen: List.replace_at(surface.screen, row, cells)}
   end
@@ -562,9 +678,9 @@ defmodule Breeze.VTerm.Surface do
       %{
         surface
         | cursor: %{surface.cursor | row: surface.rows - 1},
-          screen: rest ++ [blank_row(surface.cols)],
-          scrollback: surface.scrollback ++ [dropped]
+          screen: rest ++ [blank_row(surface.cols)]
       }
+      |> push_scrollback(dropped)
     else
       put_cursor_row(surface, next_row)
     end
@@ -576,9 +692,9 @@ defmodule Breeze.VTerm.Surface do
 
     %{
       surface
-      | screen: rest ++ repeat(count, fn -> blank_row(surface.cols) end),
-        scrollback: surface.scrollback ++ dropped
+      | screen: rest ++ repeat(count, fn -> blank_row(surface.cols) end)
     }
+    |> append_scrollback(dropped)
   end
 
   defp scroll_down(surface, count) do
@@ -657,20 +773,28 @@ defmodule Breeze.VTerm.Surface do
 
   defp row_segments(row) do
     row
-    |> Enum.reduce([], fn %{text: text, style: style}, acc ->
-      if text == "" do
+    |> Enum.reduce({[], :none, []}, fn
+      %{text: "", style: _style}, acc ->
         acc
-      else
-        append_segment(acc, text, style)
-      end
+
+      %{text: text, style: style}, {segments, style, parts} ->
+        {segments, style, [text | parts]}
+
+      %{text: text, style: style}, {segments, :none, []} ->
+        {segments, style, [text]}
+
+      %{text: text, style: style}, {segments, current_style, parts} ->
+        {[{parts_to_binary(parts), current_style} | segments], style, [text]}
     end)
-    |> Enum.reverse()
+    |> finish_row_segments()
   end
 
-  defp append_segment([{text, style} | rest], next_text, style),
-    do: [{text <> next_text, style} | rest]
+  defp finish_row_segments({segments, :none, []}), do: Enum.reverse(segments)
 
-  defp append_segment(acc, text, style), do: [{text, style} | acc]
+  defp finish_row_segments({segments, style, parts}),
+    do: Enum.reverse([{parts_to_binary(parts), style} | segments])
+
+  defp parts_to_binary(parts), do: parts |> Enum.reverse() |> IO.iodata_to_binary()
 
   defp put_cursor(surface, row, col) do
     surface
@@ -723,6 +847,35 @@ defmodule Breeze.VTerm.Surface do
   defp blank_cell, do: %{text: " ", style: %{}}
   defp wide_continuation_cell(style), do: %{text: "", style: style}
 
+  defp ascii_cells(bytes, style), do: for(<<char <- bytes>>, do: %{text: <<char>>, style: style})
+
+  defp append_scrollback(surface, rows), do: Enum.reduce(rows, surface, &push_scrollback(&2, &1))
+
+  defp push_scrollback(%{scrollback_limit: 0} = surface, _row),
+    do: %{surface | scrollback: :queue.new(), scrollback_count: 0}
+
+  defp push_scrollback(surface, row) do
+    %{
+      surface
+      | scrollback: :queue.in(row, surface.scrollback),
+        scrollback_count: surface.scrollback_count + 1
+    }
+    |> trim_scrollback()
+  end
+
+  defp trim_scrollback(%{scrollback_limit: :infinity} = surface), do: surface
+
+  defp trim_scrollback(%{scrollback_count: count, scrollback_limit: limit} = surface)
+       when count <= limit,
+       do: surface
+
+  defp trim_scrollback(surface) do
+    {{:value, _dropped}, scrollback} = :queue.out(surface.scrollback)
+
+    %{surface | scrollback: scrollback, scrollback_count: surface.scrollback_count - 1}
+    |> trim_scrollback()
+  end
+
   defp resize_saved_cursor(nil, _cols, _rows), do: nil
 
   defp resize_saved_cursor(%{row: row, col: col}, cols, rows) do
@@ -744,6 +897,10 @@ defmodule Breeze.VTerm.Surface do
 
   defp positive_int(value, _default) when is_integer(value) and value > 0, do: value
   defp positive_int(_value, default), do: default
+
+  defp scrollback_limit(:infinity), do: :infinity
+  defp scrollback_limit(value) when is_integer(value) and value >= 0, do: value
+  defp scrollback_limit(_value), do: @default_scrollback_limit
 
   defp grapheme_width(grapheme), do: max(Ucwidth.width(grapheme), 1)
   defp clamp(value, min, max), do: value |> Kernel.max(min) |> Kernel.min(max)

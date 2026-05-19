@@ -14,6 +14,8 @@ defmodule VTermExample do
   @footer_rows 1
   @terminal_min_cols 20
   @terminal_min_rows 5
+  @output_flush_ms 16
+  @child_process_flags [min_heap_size: 16_000_000]
 
   @sidebar_class "width-#{@sidebar_width} height-full overflow-hidden bg-panel"
 
@@ -48,16 +50,22 @@ defmodule VTermExample do
     }
   ]
 
-  def mount(_opts, term) do
+  def mount(opts, term) do
     terminal_size = terminal_size(term)
-    consoles = Enum.map(@console_specs, &new_console(&1, terminal_size))
+    consoles = Enum.map(@console_specs, &new_console(&1, terminal_size, opts))
 
     {:ok,
      term
      |> focus("consoles")
+     |> put_local_keybindings(base_keybindings())
      |> put_focus_keybindings("vterm", [{"^c", "Quit", &__MODULE__.quit_empty_shell/2}])
-     |> assign(consoles: consoles)
-     |> assign(selected_console: hd(consoles).id)}
+     |> assign(
+       consoles: consoles,
+       selected_console: hd(consoles).id,
+       show_debug: System.get_env("BREEZE_DEBUG") == "1",
+       pending_outputs: %{},
+       output_flush_ref: nil
+     )}
   end
 
   def render(assigns) do
@@ -109,6 +117,10 @@ defmodule VTermExample do
       <box class="height-1 bg-panel overflow-hidden">
         <.keybinding_bar keybindings={@breeze.keybindings}/>
       </box>
+      <box :if={@show_debug} style="fixed right-0 bottom-0 width-42 height-24">
+        <live id="debug" view={Breeze.Debug} start_opts={[width: 42, height: 24]}>
+        </live>
+      </box>
     </box>
     """
   end
@@ -125,21 +137,29 @@ defmodule VTermExample do
        console
        |> send_shell_input(input)
        |> track_shell_input(input)
-     end)}
+     end), invalidate: false}
   end
+
+  def handle_event(_, %{"key" => "F2"}, term),
+    do: {:noreply, assign(term, show_debug: !term.assigns.show_debug)}
 
   def handle_event(_, _, term), do: {:noreply, term}
 
   def handle_info({:vterm_output, console_id, bytes}, term) do
-    {:noreply,
-     update_console(term, console_id, fn console ->
-       console
-       |> Map.update!(:surface, &VTerm.write(&1, bytes))
-       |> track_shell_output(bytes)
-     end)}
+    {:noreply, buffer_shell_output(term, console_id, bytes), invalidate: false}
+  end
+
+  def handle_info(:flush_vterm_output, term) do
+    if map_size(term.assigns.pending_outputs) == 0 do
+      {:noreply, assign(term, output_flush_ref: nil), invalidate: false}
+    else
+      {:noreply, flush_shell_output(term)}
+    end
   end
 
   def handle_info({:vterm_exit, console_id, status}, term) do
+    term = flush_shell_output(term)
+
     {:noreply,
      update_console(term, console_id, fn console ->
        surface =
@@ -152,6 +172,7 @@ defmodule VTermExample do
   end
 
   def handle_info(:resize, term) do
+    term = flush_shell_output(term)
     size = terminal_size(term)
 
     {:noreply,
@@ -162,19 +183,31 @@ defmodule VTermExample do
 
   def handle_info(_, term), do: {:noreply, term}
 
-  defp new_console(spec, terminal_size) do
+  defp new_console(spec, terminal_size, opts) do
     console =
       spec
       |> Map.put(:status_label, status_label(spec.status))
       |> Map.put(:status_class, status_class(spec.status))
       |> Map.put(:surface, initial_surface(spec, terminal_size))
 
+    if Keyword.get(opts, :start_shells, true) do
+      start_console_shell(console, spec, terminal_size, opts)
+    else
+      console
+      |> Map.put(:shell, nil)
+      |> Map.put(:command, "")
+      |> Map.put(:shell_busy?, true)
+      |> Map.put(:prompt_cursor, nil)
+    end
+  end
+
+  defp start_console_shell(console, spec, terminal_size, opts) do
     case LocalShell.start(
            id: spec.id,
            owner: self(),
            cols: terminal_size.cols,
            rows: terminal_size.rows,
-           cwd: File.cwd!()
+           cwd: Keyword.get(opts, :cwd, File.cwd!())
          ) do
       {:ok, shell} ->
         console
@@ -208,6 +241,53 @@ defmodule VTermExample do
   defp update_consoles(term, fun) do
     assign(term, consoles: Enum.map(term.assigns.consoles, fun))
   end
+
+  defp buffer_shell_output(term, console_id, bytes) do
+    pending_outputs =
+      term.assigns.pending_outputs
+      |> Map.update(console_id, [bytes], fn chunks -> [bytes | chunks] end)
+
+    term
+    |> assign(pending_outputs: pending_outputs)
+    |> schedule_output_flush()
+  end
+
+  defp schedule_output_flush(%{assigns: %{output_flush_ref: ref}} = term) when is_reference(ref),
+    do: term
+
+  defp schedule_output_flush(term) do
+    ref = Process.send_after(self(), :flush_vterm_output, @output_flush_ms)
+    assign(term, output_flush_ref: ref)
+  end
+
+  defp flush_shell_output(term) do
+    pending_outputs = Map.get(term.assigns, :pending_outputs, %{})
+
+    term =
+      term
+      |> cancel_output_flush()
+      |> assign(pending_outputs: %{}, output_flush_ref: nil)
+
+    Enum.reduce(pending_outputs, term, fn {console_id, chunks}, acc ->
+      bytes =
+        chunks
+        |> Enum.reverse()
+        |> IO.iodata_to_binary()
+
+      update_console(acc, console_id, fn console ->
+        console
+        |> Map.update!(:surface, &VTerm.write(&1, bytes))
+        |> track_shell_output(bytes)
+      end)
+    end)
+  end
+
+  defp cancel_output_flush(%{assigns: %{output_flush_ref: ref}} = term) when is_reference(ref) do
+    Process.cancel_timer(ref)
+    term
+  end
+
+  defp cancel_output_flush(term), do: term
 
   defp initial_surface(console, terminal_size) do
     VTerm.new(cols: terminal_size.cols, rows: terminal_size.rows)
@@ -282,6 +362,13 @@ defmodule VTermExample do
   defp boolean_attr(false), do: "false"
   defp boolean_attr(_value), do: "true"
 
+  defp base_keybindings do
+    [
+      {"F2", "Debug"},
+      {"F10", "Quit"}
+    ]
+  end
+
   defp shell_idle_empty?(
          %{shell_busy?: false, command: "", prompt_cursor: prompt_cursor} = console
        )
@@ -350,16 +437,21 @@ defmodule VTermExample do
   defp terminal_reserved_rows do
     @main_header_rows + @footer_rows + @terminal_border_rows
   end
+
+  def child_process_flags, do: @child_process_flags
 end
 
-Breeze.Example.run(
-  [
-    view: VTermExample,
-    alt_screen: true,
-    hide_cursor: true,
-    mouse: true,
-    reload: [paths: ["lib", "examples"]],
-    global_keybindings: [{"F10", "Quit", fn _event, term -> {:stop, term} end}]
-  ],
-  keep_alive: :infinity
-)
+unless System.get_env("BREEZE_VTERM_SKIP_RUN") in ["1", "true", "TRUE"] do
+  Breeze.Example.run(
+    [
+      view: VTermExample,
+      alt_screen: true,
+      hide_cursor: true,
+      mouse: true,
+      child_process_flags: VTermExample.child_process_flags(),
+      reload: [paths: ["lib", "examples"]],
+      global_keybindings: [{"F10", "Quit", fn _event, term -> {:stop, term} end}]
+    ],
+    keep_alive: :infinity
+  )
+end

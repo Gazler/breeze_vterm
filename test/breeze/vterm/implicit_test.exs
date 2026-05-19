@@ -42,6 +42,34 @@ defmodule Breeze.VTerm.ImplicitTest do
     refute Keyword.has_key?(meta, :captures_keys)
   end
 
+  test "cursor-only changes do not force a layout rerender" do
+    last_state = %{
+      cols: 10,
+      rows: 3,
+      content_height: 12,
+      scrollback_rows: 8,
+      offset_y: 0,
+      cursor: %{row: 0, col: 0, char: " "}
+    }
+
+    assert {:ok, _state, meta} =
+             Implicit.init(
+               [],
+               %{
+                 :"terminal-cols" => 10,
+                 :"terminal-rows" => 3,
+                 :"terminal-content-height" => 12,
+                 :"terminal-scrollback-rows" => 8,
+                 :"terminal-cursor-row" => 0,
+                 :"terminal-cursor-col" => 1,
+                 :"terminal-cursor-char" => "x"
+               },
+               last_state
+             )
+
+    refute Keyword.has_key?(meta, :requires_layout_rerender)
+  end
+
   test "control and focus key capture can be released without disabling page scroll" do
     assert {:ok, _state, meta} =
              Implicit.init(

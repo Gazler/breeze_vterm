@@ -22,11 +22,13 @@ defmodule Breeze.VTerm.Implicit do
         char: cursor_char(Map.get(root_attrs, :"terminal-cursor-char"))
       })
 
-    meta = [
-      active_when_focused: true,
-      rerender_every: 500,
-      requires_layout_rerender: true
-    ]
+    meta =
+      [
+        active_when_focused: true,
+        rerender_every: 500,
+        state_change_requires_rerender: false
+      ]
+      |> maybe_require_layout_rerender(last_state, state)
 
     meta =
       if truthy_attr?(Map.get(root_attrs, :"terminal-capture-breeze-shortcuts", true)) do
@@ -81,6 +83,20 @@ defmodule Breeze.VTerm.Implicit do
     do: [scroll_y: effective_offset_y(state, viewport_from_flags(flags))]
 
   def handle_modifiers(:child, _flags, _state), do: []
+
+  defp maybe_require_layout_rerender(meta, last_state, state) do
+    if layout_affecting_state_changed?(last_state, state) do
+      Keyword.put(meta, :requires_layout_rerender, true)
+    else
+      meta
+    end
+  end
+
+  defp layout_affecting_state_changed?(last_state, state) do
+    Enum.any?([:cols, :rows, :content_height, :scrollback_rows, :offset_y], fn key ->
+      Map.get(last_state, key) != Map.get(state, key)
+    end)
+  end
 
   def animate(:root, box, _flags, state, %{layout: layout} = ctx) when is_map(layout) do
     {:ok, box,

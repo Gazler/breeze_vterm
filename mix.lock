@@ -1,7 +1,7 @@
 %{
-  "back_breeze": {:hex, :back_breeze, "0.4.0", "ecf6fc6e9e84837156d3fa01d96c8be1c7750140f78cc824db2bd06b1a78d142", [:mix], [{:termite, "~> 0.4.2 or ~> 0.5", [hex: :termite, repo: "hexpm", optional: false]}], "hexpm", "a41872c2703bc784911de4a4e4322c902731ae2d577fe03da54107d5825e2c57"},
-  "breeze": {:git, "https://github.com/Gazler/breeze.git", "7a0b2370da9645e3cc4aeaa5ded27f067a6e7c7f", [branch: "feat/key-capture"]},
+  "back_breeze": {:git, "https://github.com/Gazler/back_breeze.git", "433963972c3e19d556e3cc719c149051969b0473", []},
+  "breeze": {:git, "https://github.com/Gazler/breeze.git", "1aea00bc162047bb7926e19b6eb70ece6349df4c", []},
   "file_system": {:hex, :file_system, "1.1.1", "31864f4685b0148f25bd3fbef2b1228457c0c89024ad67f7a81a3ffbc0bbad3a", [:mix], [], "hexpm", "7a15ff97dfe526aeefb090a7a9d3d03aa907e100e262a0f8f7746b78f8f87a5d"},
   "telemetry": {:hex, :telemetry, "1.4.2", "a0cb522801dffb1c49fe6e30561badffc7b6d0e180db1300df759faa22062855", [:rebar3], [], "hexpm", "928f6495066506077862c0d1646609eed891a4326bee3126ba54b60af61febb1"},
-  "termite": {:git, "https://github.com/gazler/termite.git", "4e1c13d389fba0544f2914fd2072f78bcc717a62", [branch: "feat/enhanced-keyboard"]},
+  "termite": {:git, "https://github.com/Gazler/termite.git", "4321fb15c734ea171f0abc7de767ea5f37f13fc4", []},
 }
