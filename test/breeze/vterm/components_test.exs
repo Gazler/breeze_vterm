@@ -4,6 +4,41 @@ defmodule Breeze.VTerm.ComponentsTest do
   alias Breeze.ChildServer
   alias Breeze.VTerm.Surface
 
+  defmodule PromptTerminalExample do
+    use Breeze.View
+    import Breeze.VTerm.Components
+
+    def mount(_opts, term) do
+      surface = Surface.new(cols: 8, rows: 2) |> Surface.write("❯ ")
+      {:ok, term |> focus("terminal") |> assign(surface: surface)}
+    end
+
+    def render(assigns) do
+      ~H"""
+      <box class="width-10 height-4">
+        <.terminal id="terminal" surface={@surface} class="border"/>
+      </box>
+      """
+    end
+
+    def handle_info({:output, bytes}, term) do
+      {:noreply, assign(term, surface: Surface.write(term.assigns.surface, bytes))}
+    end
+  end
+
+  test "a shell bell after backspace preserves the bordered terminal frame" do
+    {:ok, pid} = ChildServer.start(view: PromptTerminalExample, start_opts: [])
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    assert {:ok, _, before_box} = ChildServer.render(pid, focused: "terminal")
+    send(pid, {:output, "\a"})
+    assert {:ok, _, after_box} = ChildServer.render(pid, focused: "terminal")
+
+    assert after_box.content == before_box.content
+    refute after_box.content =~ "\a"
+    assert Enum.all?(plain_rows(after_box.content), &(BackBreeze.Utils.string_length(&1) == 10))
+  end
+
   defmodule TerminalExample do
     use Breeze.View
     import Breeze.VTerm.Components

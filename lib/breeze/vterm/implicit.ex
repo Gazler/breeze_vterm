@@ -51,7 +51,7 @@ defmodule Breeze.VTerm.Implicit do
     {:noreply, scroll_page(state, element, 1)}
   end
 
-  def handle_event(_, %{"mouse" => %{button: :wheel_down} = mouse, "element" => element}, state) do
+  def handle_event(_, %{"mouse" => %{"button" => "wheel_down"} = mouse, "element" => element}, state) do
     viewport = Viewport.from_dimensions(element)
 
     offset_y =
@@ -60,7 +60,7 @@ defmodule Breeze.VTerm.Implicit do
     {:noreply, put_offset(state, offset_y, viewport)}
   end
 
-  def handle_event(_, %{"mouse" => %{button: :wheel_up} = mouse, "element" => element}, state) do
+  def handle_event(_, %{"mouse" => %{"button" => "wheel_up"} = mouse, "element" => element}, state) do
     viewport = Viewport.from_dimensions(element)
 
     offset_y =

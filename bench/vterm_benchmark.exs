@@ -190,7 +190,7 @@ defmodule BreezeVTerm.Benchmark do
   defp dispatch_input(pid, input), do: ChildServer.dispatch_input(pid, input)
 
   defp dispatch_info(pid, message) do
-    GenServer.call(pid, {:info, message, @terminal}, @call_timeout)
+    ChildServer.dispatch_info(pid, message, @terminal)
   end
 
   defp warmup_interactions(_pid, count, _echo_bytes) when count <= 0, do: []

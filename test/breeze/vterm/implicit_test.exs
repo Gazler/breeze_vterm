@@ -97,7 +97,7 @@ defmodule Breeze.VTerm.ImplicitTest do
     assert {:noreply, state} =
              Implicit.handle_event(
                :ignore,
-               %{"mouse" => %{button: :wheel_up}, "element" => viewport(4, 12)},
+               %{"mouse" => %{"button" => "wheel_up"}, "element" => viewport(4, 12)},
                state
              )
 
@@ -110,7 +110,7 @@ defmodule Breeze.VTerm.ImplicitTest do
     assert {:noreply, state} =
              Implicit.handle_event(
                :ignore,
-               %{"mouse" => %{button: :wheel_down, repeat: 2}, "element" => viewport(4, 12)},
+               %{"mouse" => %{"button" => "wheel_down", "repeat" => 2}, "element" => viewport(4, 12)},
                state
              )
 

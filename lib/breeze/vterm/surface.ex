@@ -20,6 +20,7 @@ defmodule Breeze.VTerm.Surface do
             scrollback: {[], []},
             scrollback_count: 0,
             buffer: "",
+            parser_state: :ground,
             saved_cursor: nil,
             saved_screen_cursor: nil,
             saved_screen: nil,
@@ -50,6 +51,8 @@ defmodule Breeze.VTerm.Surface do
           scrollback: :queue.queue(row()),
           scrollback_count: non_neg_integer(),
           buffer: binary(),
+          parser_state:
+            :ground | :osc | :osc_escape | :discard_csi | {:csi, [byte()], non_neg_integer()},
           saved_cursor: %{row: non_neg_integer(), col: non_neg_integer()} | nil,
           saved_screen_cursor: %{row: non_neg_integer(), col: non_neg_integer()} | nil,
           saved_screen: [row()] | nil,
@@ -62,6 +65,7 @@ defmodule Breeze.VTerm.Surface do
 
   @ansi_8_color_count 8
   @default_scrollback_limit 10_000
+  @max_csi_bytes 256
 
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
@@ -92,7 +96,7 @@ defmodule Breeze.VTerm.Surface do
   @spec write(t(), binary()) :: t()
   def write(%__MODULE__{} = surface, bytes) when is_binary(bytes) do
     {surface, buffer} = consume(%{surface | buffer: ""}, surface.buffer <> bytes)
-    %{surface | buffer: buffer, version: surface.version + 1}
+    %{surface | buffer: :binary.copy(buffer), version: surface.version + 1}
   end
 
   @spec resize(t(), pos_integer(), pos_integer()) :: t()
@@ -246,26 +250,32 @@ defmodule Breeze.VTerm.Surface do
     :queue.to_list(slice)
   end
 
+  defp consume(%{parser_state: :osc} = surface, bytes), do: consume_osc(surface, bytes)
+
+  defp consume(%{parser_state: :osc_escape} = surface, ""), do: {surface, ""}
+
+  defp consume(%{parser_state: :osc_escape} = surface, <<?\\, rest::binary>>),
+    do: consume(%{surface | parser_state: :ground}, rest)
+
+  defp consume(%{parser_state: :osc_escape} = surface, bytes),
+    do: consume_osc(%{surface | parser_state: :osc}, bytes)
+
+  defp consume(%{parser_state: {:csi, params, count}} = surface, bytes),
+    do: consume_csi(surface, bytes, params, count)
+
+  defp consume(%{parser_state: :discard_csi} = surface, bytes),
+    do: consume_csi(surface, bytes, [], @max_csi_bytes + 1)
+
   defp consume(surface, ""), do: {surface, ""}
 
-  defp consume(surface, <<?\e, ?[, rest::binary>>) do
-    case take_csi(rest) do
-      {:ok, params, final, rest} ->
-        surface
-        |> apply_csi(params, final)
-        |> consume(rest)
+  defp consume(surface, <<?\e, ?[, rest::binary>>),
+    do: consume_csi(surface, rest, [], 0)
 
-      :incomplete ->
-        {surface, <<?\e, ?[, rest::binary>>}
-    end
-  end
+  defp consume(surface, <<?\e, ?], rest::binary>>),
+    do: consume_osc(surface, rest)
 
-  defp consume(surface, <<?\e, ?], rest::binary>>) do
-    case take_osc(rest) do
-      {:ok, rest} -> consume(surface, rest)
-      :incomplete -> {surface, <<?\e, ?], rest::binary>>}
-    end
-  end
+  defp consume(surface, <<?\e, charset>>) when charset in [?(, ?)],
+    do: {surface, <<?\e, charset>>}
 
   defp consume(surface, <<?\e, ?(, _charset, rest::binary>>), do: consume(surface, rest)
   defp consume(surface, <<?\e, ?), _charset, rest::binary>>), do: consume(surface, rest)
@@ -309,6 +319,10 @@ defmodule Breeze.VTerm.Surface do
     consume(surface, rest)
   end
 
+  # Controls such as the shell's backspace bell must never reach rendered text.
+  defp consume(surface, <<char, rest::binary>>) when char < 0x20 or char == 0x7F,
+    do: consume(surface, rest)
+
   defp consume(surface, <<char, _rest::binary>> = bytes) when char in 0x20..0x7E do
     {run, rest} = take_printable_ascii(bytes)
 
@@ -316,6 +330,10 @@ defmodule Breeze.VTerm.Surface do
     |> put_ascii_run(run)
     |> consume(rest)
   end
+
+  # UTF-8 encoded C1 controls are not printable text either.
+  defp consume(surface, <<0xC2, char, rest::binary>>) when char in 0x80..0x9F,
+    do: consume(surface, rest)
 
   defp consume(surface, bytes) do
     case next_grapheme(bytes) do
@@ -332,10 +350,6 @@ defmodule Breeze.VTerm.Surface do
     end
   end
 
-  defp take_csi(bytes), do: do_take_csi(bytes, [])
-
-  defp take_osc(bytes), do: do_take_osc(bytes)
-
   defp take_printable_ascii(bytes), do: do_take_printable_ascii(bytes, bytes, 0)
 
   defp do_take_printable_ascii(original, <<char, rest::binary>>, count)
@@ -345,22 +359,54 @@ defmodule Breeze.VTerm.Surface do
   defp do_take_printable_ascii(_original, rest, 0), do: {"", rest}
 
   defp do_take_printable_ascii(original, rest, count) do
-    <<run::binary-size(count), _remaining::binary>> = original
+    run = binary_part(original, 0, count)
     {run, rest}
   end
 
-  defp do_take_osc(""), do: :incomplete
-  defp do_take_osc(<<?\a, rest::binary>>), do: {:ok, rest}
-  defp do_take_osc(<<?\e, ?\\, rest::binary>>), do: {:ok, rest}
-  defp do_take_osc(<<_char, rest::binary>>), do: do_take_osc(rest)
+  # OSC payloads are unsupported: discard as they arrive, retaining only whether
+  # an ESC might be the first half of a split string terminator.
+  defp consume_osc(surface, ""), do: {%{surface | parser_state: :osc}, ""}
 
-  defp do_take_csi("", _acc), do: :incomplete
+  defp consume_osc(surface, <<char, rest::binary>>) when char in [7, 24, 26],
+    do: consume(%{surface | parser_state: :ground}, rest)
 
-  defp do_take_csi(<<final, rest::binary>>, acc) when final in 0x40..0x7E do
-    {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary(), <<final>>, rest}
+  defp consume_osc(surface, <<?\e, rest::binary>>),
+    do: consume(%{surface | parser_state: :osc_escape}, rest)
+
+  defp consume_osc(surface, <<_char, rest::binary>>), do: consume_osc(surface, rest)
+
+  defp consume_csi(surface, "", _params, count) when count > @max_csi_bytes,
+    do: {%{surface | parser_state: :discard_csi}, ""}
+
+  defp consume_csi(surface, "", params, count),
+    do: {%{surface | parser_state: {:csi, params, count}}, ""}
+
+  defp consume_csi(surface, <<?\e, _::binary>> = bytes, _params, _count),
+    do: consume(%{surface | parser_state: :ground}, bytes)
+
+  defp consume_csi(surface, <<char, rest::binary>>, _params, _count) when char in [24, 26],
+    do: consume(%{surface | parser_state: :ground}, rest)
+
+  defp consume_csi(surface, <<final, rest::binary>>, params, count) when final in 0x40..0x7E do
+    surface = %{surface | parser_state: :ground}
+
+    surface =
+      if count <= @max_csi_bytes do
+        apply_csi(surface, params |> Enum.reverse() |> :erlang.list_to_binary(), <<final>>)
+      else
+        surface
+      end
+
+    consume(surface, rest)
   end
 
-  defp do_take_csi(<<char, rest::binary>>, acc), do: do_take_csi(rest, [<<char>> | acc])
+  defp consume_csi(surface, <<char, rest::binary>>, params, count)
+       when char in 0x20..0x3F and count < @max_csi_bytes,
+       do: consume_csi(surface, rest, [char | params], count + 1)
+
+  # Overlong or malformed CSI sequences remain discarded through their final byte.
+  defp consume_csi(surface, <<_char, rest::binary>>, _params, _count),
+    do: consume_csi(surface, rest, [], @max_csi_bytes + 1)
 
   defp apply_csi(surface, params, "m"), do: apply_sgr(surface, sgr_params(params))
   defp apply_csi(surface, params, "h"), do: apply_private_mode(surface, params, true)
@@ -620,7 +666,8 @@ defmodule Breeze.VTerm.Surface do
       true ->
         available = surface.cols - surface.cursor.col
         take = min(byte_size(bytes), available)
-        <<chunk::binary-size(take), rest::binary>> = bytes
+        chunk = binary_part(bytes, 0, take)
+        rest = binary_part(bytes, take, byte_size(bytes) - take)
         cells = ascii_cells(chunk, surface.style)
 
         surface =
@@ -654,15 +701,18 @@ defmodule Breeze.VTerm.Surface do
   end
 
   defp put_cell(surface, row, col, cell) do
-    current_row = Enum.at(surface.screen, row, blank_row(surface.cols))
-    put_row(surface, row, List.replace_at(current_row, col, cell))
+    update_row(surface, row, &List.replace_at(&1, col, cell))
   end
 
   defp put_cells(surface, row, col, cells, count) do
-    current_row = Enum.at(surface.screen, row, blank_row(surface.cols))
-    {prefix, rest} = Enum.split(current_row, col)
-    {_replaced, suffix} = Enum.split(rest, count)
-    put_row(surface, row, prefix ++ cells ++ suffix)
+    update_row(surface, row, fn current_row ->
+      {prefix, rest} = Enum.split(current_row, col)
+      prefix ++ cells ++ Enum.drop(rest, count)
+    end)
+  end
+
+  defp update_row(surface, row, fun) do
+    %{surface | screen: List.update_at(surface.screen, row, fun)}
   end
 
   defp put_row(surface, row, cells) do
@@ -712,7 +762,7 @@ defmodule Breeze.VTerm.Surface do
   defp clear_from_cursor(surface) do
     Enum.reduce(surface.cursor.row..(surface.rows - 1), surface, fn row, acc ->
       first_col = if row == surface.cursor.row, do: surface.cursor.col, else: 0
-      cells = Enum.at(acc.screen, row, blank_row(acc.cols))
+      cells = Enum.at(acc.screen, row)
 
       cleared =
         cells
@@ -729,7 +779,7 @@ defmodule Breeze.VTerm.Surface do
   defp clear_to_cursor(surface) do
     Enum.reduce(0..surface.cursor.row, surface, fn row, acc ->
       last_col = if row == surface.cursor.row, do: surface.cursor.col, else: surface.cols - 1
-      cells = Enum.at(acc.screen, row, blank_row(acc.cols))
+      cells = Enum.at(acc.screen, row)
 
       cleared =
         cells
@@ -744,7 +794,7 @@ defmodule Breeze.VTerm.Surface do
   end
 
   defp clear_line_from_cursor(surface) do
-    cells = Enum.at(surface.screen, surface.cursor.row, blank_row(surface.cols))
+    cells = Enum.at(surface.screen, surface.cursor.row)
 
     cleared =
       cells
@@ -758,7 +808,7 @@ defmodule Breeze.VTerm.Surface do
   end
 
   defp clear_line_to_cursor(surface) do
-    cells = Enum.at(surface.screen, surface.cursor.row, blank_row(surface.cols))
+    cells = Enum.at(surface.screen, surface.cursor.row)
 
     cleared =
       cells
@@ -810,15 +860,22 @@ defmodule Breeze.VTerm.Surface do
     %{surface | cursor: %{surface.cursor | col: clamp(col, 0, surface.cols)}}
   end
 
+  defp next_grapheme(<<_codepoint::utf8, _rest::binary>> = bytes) do
+    {grapheme, rest} = String.next_grapheme(bytes)
+    {:ok, grapheme, rest}
+  end
+
   defp next_grapheme(bytes) do
-    case String.next_grapheme(bytes) do
-      {grapheme, rest} -> {:ok, grapheme, rest}
-      nil -> :incomplete
+    # Only a valid, unfinished UTF-8 prefix is buffered (at most three bytes).
+    # Invalid leading bytes are dropped without passing them to the width renderer.
+    case :unicode.characters_to_binary(binary_part(bytes, 0, min(byte_size(bytes), 4))) do
+      {:incomplete, "", _prefix} ->
+        :incomplete
+
+      _ ->
+        <<_byte, rest::binary>> = bytes
+        {:drop, rest}
     end
-  rescue
-    ArgumentError ->
-      <<_byte, rest::binary>> = bytes
-      {:drop, rest}
   end
 
   defp printable_input?(key) do
@@ -842,8 +899,8 @@ defmodule Breeze.VTerm.Surface do
   defp ctrl_input("Backspace"), do: "\x17"
   defp ctrl_input(_key), do: nil
 
-  defp blank_screen(cols, rows), do: repeat(rows, fn -> blank_row(cols) end)
-  defp blank_row(cols), do: repeat(cols, &blank_cell/0)
+  defp blank_screen(cols, rows), do: List.duplicate(blank_row(cols), rows)
+  defp blank_row(cols), do: List.duplicate(blank_cell(), cols)
   defp blank_cell, do: %{text: " ", style: %{}}
   defp wide_continuation_cell(style), do: %{text: "", style: style}
 

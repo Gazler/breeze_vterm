@@ -7,6 +7,8 @@ defmodule VTermExample do
   alias Breeze.VTerm.LocalShell
   alias Breeze.VTerm
 
+  require Logger
+
   @sidebar_width 35
   @terminal_border_cols 2
   @terminal_border_rows 2
@@ -165,7 +167,7 @@ defmodule VTermExample do
        surface =
          console.surface
          |> VTerm.write("\r\n")
-         |> VTerm.write("\e[31mlocal shell exited with status #{status}\e[0m\r\n")
+         |> VTerm.write("\e[31mlocal shell exited with status #{inspect(status)}\e[0m\r\n")
 
        %{console | shell: nil, surface: surface}
      end)}
@@ -177,6 +179,13 @@ defmodule VTermExample do
 
     {:noreply,
      update_consoles(term, fn console ->
+       if is_pid(console.shell) do
+         case LocalShell.resize(console.shell, size.cols, size.rows) do
+           :ok -> :ok
+           {:error, reason} -> Logger.warning("Could not resize local PTY: #{inspect(reason)}")
+         end
+       end
+
        %{console | surface: VTerm.resize(console.surface, size.cols, size.rows)}
      end)}
   end

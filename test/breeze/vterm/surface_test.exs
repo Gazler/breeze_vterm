@@ -3,6 +3,107 @@ defmodule Breeze.VTerm.SurfaceTest do
 
   alias Breeze.VTerm.Surface
 
+  test "UTF-8 codepoints survive every byte split" do
+    for text <- ["é", "❯", "🍏"], split <- 1..(byte_size(text) - 1) do
+      prefix = binary_part(text, 0, split)
+      suffix = binary_part(text, split, byte_size(text) - split)
+      surface = Surface.new(cols: 8, rows: 2) |> Surface.write(prefix)
+      assert surface.buffer == prefix
+      assert surface.cursor == %{row: 0, col: 0}
+      surface = Surface.write(surface, suffix <> "x")
+      assert surface.buffer == ""
+
+      assert surface.screen ==
+               (Surface.new(cols: 8, rows: 2) |> Surface.write(text <> "x")).screen
+    end
+  end
+
+  test "malformed UTF-8 is discarded without losing subsequent output" do
+    for bytes <- [<<255>>, <<128>>, <<192, 175>>, <<237, 160, 128>>, <<244, 144, 128, 128>>] do
+      surface = Surface.new(cols: 8, rows: 1) |> Surface.write(bytes <> "ok")
+      assert Surface.lines(surface) == ["ok      "]
+      assert surface.buffer == ""
+    end
+
+    surface = Surface.new(cols: 8, rows: 1) |> Surface.write(<<226>>) |> Surface.write("ok")
+    assert Surface.lines(surface) == ["ok      "]
+  end
+
+  test "UTF-8 encoded controls cannot leak into rendered text" do
+    for codepoint <- 0x80..0x9F do
+      surface =
+        Surface.new(cols: 8, rows: 1)
+        |> Surface.write(<<0xC2>>)
+        |> Surface.write(<<codepoint>> <> "ok")
+
+      assert Surface.lines(surface) == ["ok      "]
+    end
+  end
+
+  test "OSC payloads are discarded incrementally, including split terminators" do
+    surface = Surface.new(cols: 8, rows: 1) |> Surface.write("\e]52;c;")
+
+    surface =
+      Enum.reduce(1..64, surface, fn _, acc ->
+        next = Surface.write(acc, String.duplicate("x", 4096))
+        assert next.buffer == ""
+        assert next.parser_state == :osc
+        next
+      end)
+
+    surface = surface |> Surface.write("\e") |> Surface.write("\\ok")
+    assert surface.parser_state == :ground
+    assert Surface.lines(surface) == ["ok      "]
+  end
+
+  test "overlong CSI parameters stay bounded and are ignored through their final byte" do
+    surface = Surface.new(cols: 8, rows: 1) |> Surface.write("\e[")
+
+    surface =
+      Enum.reduce(1..64, surface, fn _, acc ->
+        next = Surface.write(acc, String.duplicate("1;", 2048))
+        assert next.buffer == ""
+        assert next.parser_state == :discard_csi
+        next
+      end)
+
+    surface = Surface.write(surface, "31mplain\e[32mG")
+
+    assert Surface.slice(surface, 0, 1) == [
+             [{"plain", %{}}, {"G", %{foreground_color: 2}}, {"  ", %{}}]
+           ]
+  end
+
+  test "CSI parsing is independent of chunk boundaries and supports cancellation" do
+    bytes = "\e[38;2;12;34;56mhello\e[0m\e]ignored\a!"
+    initial = Surface.new(cols: 10, rows: 1)
+    chunked = Enum.reduce(:binary.bin_to_list(bytes), initial, &Surface.write(&2, <<&1>>))
+    assert chunked.screen == Surface.write(initial, bytes).screen
+
+    for prefix <- ["\e[12;", "\e[" <> String.duplicate("1", 300), "\e]ignored"] do
+      surface = initial |> Surface.write(prefix) |> Surface.write(<<24>> <> "ok")
+      assert Surface.lines(surface) == ["ok        "]
+    end
+  end
+
+  test "an empty-prompt backspace bell does not occupy a cell or damage rendered rows" do
+    surface = Surface.new(cols: 8, rows: 2) |> Surface.write("❯ ")
+    after_bell = Surface.write(surface, "\a")
+
+    assert after_bell.cursor == surface.cursor
+    assert Surface.lines(after_bell) == Surface.lines(surface)
+    assert Surface.slice(after_bell, 0, 2) == Surface.slice(surface, 0, 2)
+  end
+
+  test "ignores nonprinting control bytes while preserving backspace editing" do
+    surface =
+      Surface.new(cols: 8, rows: 2)
+      |> Surface.write("❯ x\b \b" <> <<0, 7, 14, 15, 17, 19, 127>>)
+
+    assert Surface.lines(surface) == ["❯       ", "        "]
+    assert surface.cursor == %{row: 0, col: 2}
+  end
+
   test "writes printable text into the screen" do
     surface =
       Surface.new(cols: 8, rows: 2)
