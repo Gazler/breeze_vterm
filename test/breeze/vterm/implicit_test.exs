@@ -101,16 +101,19 @@ defmodule Breeze.VTerm.ImplicitTest do
                state
              )
 
-    assert state.offset_y == 6
+    assert state.offset_y == 5
     assert state.pinned_bottom == false
 
-    assert [scroll_y: 6] =
+    assert [scroll_y: 5] =
              Implicit.handle_modifiers(:root, [layout_element: viewport(4, 12)], state)
 
     assert {:noreply, state} =
              Implicit.handle_event(
                :ignore,
-               %{"mouse" => %{"button" => "wheel_down", "repeat" => 2}, "element" => viewport(4, 12)},
+               %{
+                 "mouse" => %{"button" => "wheel_down", "repeat" => 2},
+                 "element" => viewport(4, 12)
+               },
                state
              )
 
@@ -119,6 +122,31 @@ defmodule Breeze.VTerm.ImplicitTest do
 
     assert [scroll_y: 8] =
              Implicit.handle_modifiers(:root, [layout_element: viewport(4, 12)], state)
+  end
+
+  test "wheel step is independent of viewport height and honors coalesced repeats" do
+    for height <- [4, 24, 60] do
+      bottom = 200 - height
+
+      {:ok, state, _} =
+        Implicit.init([], %{:"terminal-content-height" => 200}, %{
+          offset_y: bottom,
+          pinned_bottom: true
+        })
+
+      assert {:noreply, state} =
+               Implicit.handle_event(
+                 :ignore,
+                 %{
+                   "mouse" => %{"button" => "wheel_up", "repeat" => 5},
+                   "element" => viewport(height, 200)
+                 },
+                 state
+               )
+
+      assert state.offset_y == bottom - 15
+      refute state.pinned_bottom
+    end
   end
 
   test "page keys scroll the buffer without forwarding terminal input" do
