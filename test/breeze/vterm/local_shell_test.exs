@@ -46,6 +46,32 @@ defmodule Breeze.VTerm.LocalShellTest do
     assert_receive {:DOWN, ^monitor, :process, ^shell, :normal}, 1000
   end
 
+  test "a program waiting for color and cursor queries receives both replies through its PTY" do
+    {:ok, shell} = LocalShell.start(id: :resize_test, shell: "/bin/sh")
+    LocalShell.write(shell, "stty -echo; printf '\\nREADY\\n'\n")
+    await_output("\r\nREADY\r\n")
+
+    expected = "\e]11;rgb:1e1e/1e1e/2e2e\a\e[1;1R"
+
+    surface =
+      Surface.new(
+        background_color: {30, 30, 46},
+        on_reply: &LocalShell.write(shell, &1)
+      )
+
+    # A noncanonical read with a one-second timeout models a querying program.
+    LocalShell.write(
+      shell,
+      "stty -icanon min 0 time 10; printf '\\033[1;1H\\033]11;?\\007\\033[6n'; " <>
+        "reply=$(dd bs=1 count=#{byte_size(expected)} 2>/dev/null); " <>
+        "printf '\\nREPLY:%s\\n' \"$reply\"\n"
+    )
+
+    Surface.write(surface, await_output("\e]11;?\a\e[6n"))
+    await_output("REPLY:" <> expected)
+    GenServer.stop(shell)
+  end
+
   test "resizes the PTY seen by a nested terminal application and sends SIGWINCH" do
     {:ok, shell} =
       LocalShell.start(owner: self(), id: :resize_test, shell: "/bin/sh", cols: 73, rows: 24)

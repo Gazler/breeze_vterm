@@ -4,7 +4,8 @@ defmodule Breeze.VTerm.Surface do
 
   The surface is transport agnostic: callers feed output bytes with `write/2`,
   forward encoded input bytes from `input/1` to their backend, and render the
-  current screen with `virtual_text/1`.
+  current screen with `virtual_text/1`. An optional `:on_reply` callback forwards
+  terminal query responses to the same backend.
   """
 
   alias BackBreeze.Ucwidth
@@ -21,6 +22,9 @@ defmodule Breeze.VTerm.Surface do
             scrollback_count: 0,
             buffer: "",
             parser_state: :ground,
+            on_reply: nil,
+            foreground_color: {229, 229, 229},
+            background_color: {0, 0, 0},
             saved_cursor: nil,
             saved_screen_cursor: nil,
             saved_screen: nil,
@@ -32,7 +36,8 @@ defmodule Breeze.VTerm.Surface do
             alt_screen?: false,
             version: 0
 
-  @type color :: 0..255 | {0..255, 0..255, 0..255}
+  @type rgb :: {0..255, 0..255, 0..255}
+  @type color :: 0..255 | rgb()
   @type style :: %{
           optional(:foreground_color) => color(),
           optional(:background_color) => color(),
@@ -54,7 +59,16 @@ defmodule Breeze.VTerm.Surface do
           scrollback_count: non_neg_integer(),
           buffer: binary(),
           parser_state:
-            :ground | :osc | :osc_escape | :discard_csi | {:csi, [byte()], non_neg_integer()},
+            :ground
+            | :osc
+            | :osc_escape
+            | {:osc, binary()}
+            | {:osc_escape, binary()}
+            | :discard_csi
+            | {:csi, [byte()], non_neg_integer()},
+          on_reply: (binary() -> term()) | nil,
+          foreground_color: rgb(),
+          background_color: rgb(),
           saved_cursor: %{row: non_neg_integer(), col: non_neg_integer()} | nil,
           saved_screen_cursor: %{row: non_neg_integer(), col: non_neg_integer()} | nil,
           saved_screen: [row()] | nil,
@@ -71,6 +85,19 @@ defmodule Breeze.VTerm.Surface do
   @default_scrollback_limit 10_000
   @max_csi_bytes 256
 
+  @doc """
+  Creates a terminal surface.
+
+  Set `:on_reply` to a one-argument function to answer OSC 10 (foreground),
+  OSC 11 (background), and CSI 6 n (cursor position) queries. It receives reply
+  bytes synchronously during `write/2`; forward them to the PTY or other transport
+  as input. Its return value is ignored. Without a callback, queries are discarded.
+
+  `:foreground_color` and `:background_color` specify the colors reported by those
+  replies as `{red, green, blue}` tuples with components in `0..255`. They default
+  to `{229, 229, 229}` and `{0, 0, 0}`. These options do not change cell styling;
+  pass the host's actual default colors when available.
+  """
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     cols = positive_int(Keyword.get(opts, :cols, Keyword.get(opts, :columns, 80)), 80)
@@ -93,7 +120,10 @@ defmodule Breeze.VTerm.Surface do
       screen: blank_screen(cols, rows),
       scrollback: :queue.new(),
       scrollback_count: 0,
-      cursor: %{row: 0, col: 0}
+      cursor: %{row: 0, col: 0},
+      on_reply: reply_callback(Keyword.get(opts, :on_reply)),
+      foreground_color: query_color(opts, :foreground_color, {229, 229, 229}),
+      background_color: query_color(opts, :background_color, {0, 0, 0})
     }
   end
 
@@ -256,6 +286,17 @@ defmodule Breeze.VTerm.Surface do
 
   defp consume(%{parser_state: :osc} = surface, bytes), do: consume_osc(surface, bytes)
 
+  defp consume(%{parser_state: {:osc, prefix}} = surface, bytes),
+    do: consume_osc_query(surface, bytes, prefix)
+
+  defp consume(%{parser_state: {:osc_escape, _prefix}} = surface, ""), do: {surface, ""}
+
+  defp consume(%{parser_state: {:osc_escape, prefix}} = surface, <<?\\, rest::binary>>),
+    do: surface |> reply_osc(prefix, "\e\\") |> consume(rest)
+
+  defp consume(%{parser_state: {:osc_escape, _prefix}} = surface, bytes),
+    do: consume_osc(%{surface | parser_state: :osc}, bytes)
+
   defp consume(%{parser_state: :osc_escape} = surface, ""), do: {surface, ""}
 
   defp consume(%{parser_state: :osc_escape} = surface, <<?\\, rest::binary>>),
@@ -276,7 +317,7 @@ defmodule Breeze.VTerm.Surface do
     do: consume_csi(surface, rest, [], 0)
 
   defp consume(surface, <<?\e, ?], rest::binary>>),
-    do: consume_osc(surface, rest)
+    do: consume_osc_query(surface, rest, "")
 
   defp consume(surface, <<?\e, charset>>) when charset in [?(, ?)],
     do: {surface, <<?\e, charset>>}
@@ -375,8 +416,74 @@ defmodule Breeze.VTerm.Surface do
     {run, rest}
   end
 
-  # OSC payloads are unsupported: discard as they arrive, retaining only whether
-  # an ESC might be the first half of a split string terminator.
+  # Retain at most four bytes while an OSC can still be a supported color query.
+  # All other payloads are discarded as they arrive.
+  defp consume_osc_query(surface, "", prefix),
+    do: {%{surface | parser_state: {:osc, prefix}}, ""}
+
+  defp consume_osc_query(surface, <<7, rest::binary>>, prefix),
+    do: surface |> reply_osc(prefix, "\a") |> consume(rest)
+
+  defp consume_osc_query(surface, <<char, rest::binary>>, _prefix) when char in [24, 26],
+    do: consume(%{surface | parser_state: :ground}, rest)
+
+  defp consume_osc_query(surface, <<?\e, rest::binary>>, prefix),
+    do: consume(%{surface | parser_state: {:osc_escape, prefix}}, rest)
+
+  defp consume_osc_query(surface, <<char, rest::binary>>, prefix) do
+    prefix = prefix <> <<char>>
+
+    if prefix in ["1", "10", "11", "10;", "11;", "10;?", "11;?"] do
+      consume_osc_query(surface, rest, prefix)
+    else
+      consume_osc(surface, rest)
+    end
+  end
+
+  defp reply_osc(surface, query, terminator) do
+    if surface.on_reply && query in ["10;?", "11;?"] do
+      {code, color} =
+        case query do
+          "10;?" -> {"10", surface.foreground_color}
+          "11;?" -> {"11", surface.background_color}
+        end
+
+      rgb =
+        color
+        |> Tuple.to_list()
+        |> Enum.map_join("/", fn component ->
+          (component * 257)
+          |> Integer.to_string(16)
+          |> String.downcase()
+          |> String.pad_leading(4, "0")
+        end)
+
+      reply(surface, "\e]#{code};rgb:#{rgb}#{terminator}")
+    end
+
+    %{surface | parser_state: :ground}
+  end
+
+  defp reply(surface, bytes) do
+    if surface.on_reply, do: surface.on_reply.(bytes)
+    surface
+  end
+
+  defp reply_callback(callback) when is_nil(callback) or is_function(callback, 1), do: callback
+
+  defp reply_callback(_callback),
+    do: raise(ArgumentError, ":on_reply must be a one-argument function or nil")
+
+  defp query_color(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      {red, green, blue} = color when red in 0..255 and green in 0..255 and blue in 0..255 ->
+        color
+
+      _ ->
+        raise ArgumentError, "#{inspect(key)} must be an RGB tuple with components in 0..255"
+    end
+  end
+
   defp consume_osc(surface, ""), do: {%{surface | parser_state: :osc}, ""}
 
   defp consume_osc(surface, <<char, rest::binary>>) when char in [7, 24, 26],
@@ -425,6 +532,12 @@ defmodule Breeze.VTerm.Surface do
   defp apply_csi(surface, params, "l"), do: apply_private_mode(surface, params, false)
   defp apply_csi(surface, _params, "s"), do: save_cursor(surface)
   defp apply_csi(surface, _params, "u"), do: restore_cursor(surface)
+
+  defp apply_csi(surface, "6", "n") do
+    row = surface.cursor.row + 1
+    col = min(surface.cursor.col + 1, surface.cols)
+    reply(surface, "\e[#{row};#{col}R")
+  end
 
   defp apply_csi(surface, params, final) when final in ["H", "f"] do
     values = csi_params(params)

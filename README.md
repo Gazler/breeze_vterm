@@ -22,6 +22,41 @@ transport and feed its output back through `Breeze.VTerm.write/2`. The component
 provides scrolling and a cursor overlay; the application owns the transport and
 surface updates. Use `Breeze.VTerm.resize/3` when the content dimensions change.
 
+### Terminal query replies
+
+Programs such as `gh` query the terminal's background color and may pause until
+their query times out if they receive no response. Pass an `:on_reply` callback
+to send replies back as input to your transport:
+
+```elixir
+surface = Breeze.VTerm.new(
+  cols: 80,
+  rows: 24,
+  on_reply: fn bytes -> Breeze.VTerm.LocalShell.write(shell, bytes) end,
+  foreground_color: {205, 214, 244},
+  background_color: {30, 30, 46}
+)
+```
+
+`write/2` invokes the callback synchronously for each complete OSC 10 or OSC 11
+query (`ESC ] 10 ; ?` or `ESC ] 11 ; ?` followed by BEL or `ESC \`). Replies use
+the query's terminator and RGB components expanded to four hexadecimal digits,
+following the [xterm protocol](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html).
+Queries can span output chunks. The callback's return value is ignored.
+
+Cursor position queries (`ESC [ 6 n`) also receive a reply (`ESC [ row ; col R`),
+using the surface's current one-based screen coordinates. Some programs send
+this query after a color query and wait for both responses.
+
+The color options describe the host's default colors for query replies; they do
+not change rendered cell styles. Use the host's theme or probed colors when
+available. The fallback is a light foreground `{229, 229, 229}` on black
+`{0, 0, 0}`. The local-shell example enables replies automatically.
+
+Replies are disabled unless `:on_reply` is set. When adopting this callback in an
+application that already answers color queries, remove its separate responder
+to avoid sending duplicate replies. Other terminal queries remain unsupported.
+
 This is a small terminal model, not a complete xterm emulator. It supports basic
 cursor movement, erasing, SGR colors, alternate screens, and bounded scrollback.
 Unsupported control sequences are ignored. Applications requiring full-screen
@@ -61,8 +96,9 @@ resizes, including notifying nested terminal applications. Applications using
 ## Output Handling
 
 The surface buffers incomplete UTF-8 codepoints (at most three bytes) and discards
-malformed bytes. OSC payloads are discarded incrementally. CSI parameter data is
-limited to 256 bytes; overlong sequences are ignored through their final byte.
+malformed bytes. OSC parsing retains at most four bytes to recognize supported
+color queries; other payloads are discarded incrementally. CSI parameter data
+is limited to 256 bytes; overlong sequences are ignored through their final byte.
 
 `LocalShell` sends `{:vterm_output, id, bytes}`. Process the bytes directly:
 

@@ -54,7 +54,8 @@ defmodule VTermExample do
 
   def mount(opts, term) do
     terminal_size = terminal_size(term)
-    consoles = Enum.map(@console_specs, &new_console(&1, terminal_size, opts))
+    colors = query_colors(term.theme)
+    consoles = Enum.map(@console_specs, &new_console(&1, terminal_size, opts, colors))
 
     {:ok,
      term
@@ -193,12 +194,12 @@ defmodule VTermExample do
 
   def handle_info(_, term), do: {:noreply, term}
 
-  defp new_console(spec, terminal_size, opts) do
+  defp new_console(spec, terminal_size, opts, colors) do
     console =
       spec
       |> Map.put(:status_label, status_label(spec.status))
       |> Map.put(:status_class, status_class(spec.status))
-      |> Map.put(:surface, initial_surface(spec, terminal_size))
+      |> Map.put(:surface, initial_surface(spec, terminal_size, colors))
 
     if Keyword.get(opts, :start_shells, true) do
       start_console_shell(console, spec, terminal_size, opts)
@@ -222,6 +223,10 @@ defmodule VTermExample do
       {:ok, shell} ->
         console
         |> Map.put(:shell, shell)
+        |> Map.update!(
+          :surface,
+          &%{&1 | on_reply: fn bytes -> LocalShell.write(shell, bytes) end}
+        )
         |> Map.put(:command, "")
         |> Map.put(:shell_busy?, true)
         |> Map.put(:prompt_cursor, nil)
@@ -299,8 +304,22 @@ defmodule VTermExample do
 
   defp cancel_output_flush(term), do: term
 
-  defp initial_surface(console, terminal_size) do
-    VTerm.new(cols: terminal_size.cols, rows: terminal_size.rows)
+  defp query_colors(theme) do
+    theme = Breeze.Theme.new(theme)
+
+    Enum.flat_map([:foreground_color, :background_color], fn key ->
+      color = Breeze.Theme.color(theme, key)
+      color = if is_integer(color), do: Map.get(theme.terminal_palette || %{}, color), else: color
+
+      case color do
+        {_, _, _} -> [{key, color}]
+        _ -> []
+      end
+    end)
+  end
+
+  defp initial_surface(console, terminal_size, colors) do
+    VTerm.new([cols: terminal_size.cols, rows: terminal_size.rows] ++ colors)
     |> VTerm.write("\e[36m#{console.name}\e[0m connected to local PTY for #{console.host}\r\n")
     |> VTerm.write("Role: #{console.role}  Status: #{console.status}\r\n")
     |> VTerm.write(
