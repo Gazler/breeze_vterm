@@ -1,26 +1,42 @@
 defmodule Breeze.VTerm.Components do
   @moduledoc """
   Breeze components for rendering `Breeze.VTerm` surfaces.
+
+  Selection is disabled by default. Set `selectable={true}` to enable left-drag
+  text selection within the pane. Dragging at or beyond the top or bottom edge
+  scrolls through the buffer, extending the selection. Right-clicking a selection emits
+  `%{copy: text}` through `br-change`; the host writes it to the client clipboard.
+  `%{selection: :start}` and `%{selection: :clear}` let hosts route keys through
+  Breeze while a selection is active. Typing or Escape clears the selection.
+  New output or a surface resize also clears it to avoid copying stale cells.
+  Enable Breeze mouse reporting with `mouse: [mode: :drag]`.
   """
 
   use Breeze.View
 
   import Breeze.Blocks, only: [merge_class: 2]
 
-  attr(:id, :string, required: true)
-  attr(:surface, :any, required: true)
+  attr :id, :string, required: true
+  attr :surface, :any, required: true
 
-  attr(:"cursor-blink", :boolean,
+  attr :selectable, :boolean,
+    default: false,
+    doc: "Enable mouse text selection and right-click copy events"
+
+  attr :copy_notice, :integer,
+    default: nil,
+    doc: "Character count shown in a bottom-right copy toast; clear to dismiss"
+
+  attr :"cursor-blink", :boolean,
     default: true,
     doc: "Set false for a static cursor without blink ticks"
-  )
 
-  attr(:capture_breeze_shortcuts, :boolean, default: true)
-  attr(:capture_control_keys, :boolean, default: true)
-  attr(:capture_focus_keys, :boolean, default: true)
-  attr(:class, :string, default: nil)
-  attr(:style, :any, default: nil)
-  attr(:rest, :global)
+  attr :capture_breeze_shortcuts, :boolean, default: true
+  attr :capture_control_keys, :boolean, default: true
+  attr :capture_focus_keys, :boolean, default: true
+  attr :class, :string, default: nil
+  attr :style, :any, default: nil
+  attr :rest, :global
 
   def terminal(assigns) do
     surface = Map.get(assigns, :surface)
@@ -54,9 +70,13 @@ defmodule Breeze.VTerm.Components do
       id={@id}
       focusable
       implicit={Breeze.VTerm.Implicit}
+      br-update="scroll"
       class={@class}
       style={Breeze.Blocks.inline_style(assigns)}
       cursor-blink={boolean_attr(Map.get(assigns, :"cursor-blink", true))}
+      terminal-selectable={boolean_attr(assigns[:selectable] in [true, "true"])}
+      terminal-copy-notice={assigns[:copy_notice]}
+      terminal-surface={@surface}
       terminal-cols={@surface.cols}
       terminal-rows={@surface.rows}
       terminal-content-height={@line_count}

@@ -64,6 +64,7 @@ defmodule VTermExample do
      |> assign(
        consoles: consoles,
        selected_console: hd(consoles).id,
+       selecting: false,
        show_debug: System.get_env("BREEZE_DEBUG") == "1",
        pending_outputs: %{},
        output_flush_ref: nil
@@ -76,7 +77,10 @@ defmodule VTermExample do
     assigns =
       assigns
       |> assign(current_console: current_console)
-      |> assign(capture_shell_input: boolean_attr(capture_shell_input?(current_console)))
+      |> assign(
+        capture_shell_input:
+          boolean_attr(assigns.selecting or capture_shell_input?(current_console))
+      )
       |> assign(sidebar_class: @sidebar_class)
 
     ~H"""
@@ -85,6 +89,7 @@ defmodule VTermExample do
         <box class={@sidebar_class}>
           <box class="height-1 width-full overflow-hidden bold padding-left-1">Console</box>
           <.list
+            virtual
             id="consoles"
             br-change="select_console"
             list-selected={@selected_console}
@@ -109,6 +114,7 @@ defmodule VTermExample do
           <.terminal
             id="vterm"
             surface={@current_console.surface}
+            selectable
             br-change="vterm_input"
             class="border focus:border-primary"
             capture_control_keys={@capture_shell_input}
@@ -128,18 +134,31 @@ defmodule VTermExample do
   end
 
   def handle_event("select_console", %{value: value}, term) do
-    {:noreply, assign(term, selected_console: value)}
+    {:noreply, assign(term, selected_console: value, selecting: false)}
+  end
+
+  def handle_event("vterm_input", %{selection: selection}, term)
+      when selection in [:start, :clear] do
+    {:noreply, assign(term, selecting: selection == :start)}
+  end
+
+  def handle_event("vterm_input", %{copy: text}, term) do
+    terminal = Termite.Terminal.write(term.terminal, "\e]52;c;" <> Base.encode64(text) <> "\e\\")
+    {:noreply, %{term | terminal: terminal}}
   end
 
   def handle_event("vterm_input", %{input: input}, term) do
     console_id = term.assigns |> current_console() |> Map.fetch!(:id)
+    selecting = term.assigns.selecting
 
     {:noreply,
-     update_console(term, console_id, fn console ->
+     term
+     |> assign(selecting: false)
+     |> update_console(console_id, fn console ->
        console
        |> send_shell_input(input)
        |> track_shell_input(input)
-     end), invalidate: false}
+     end), invalidate: selecting}
   end
 
   def handle_event(_, %{"key" => "F2"}, term),
@@ -174,7 +193,7 @@ defmodule VTermExample do
   end
 
   def handle_info(:resize, term) do
-    term = flush_shell_output(term)
+    term = term |> flush_shell_output() |> assign(selecting: false)
     size = terminal_size(term)
 
     {:noreply,
@@ -244,7 +263,12 @@ defmodule VTermExample do
         if console.id == console_id, do: fun.(console), else: console
       end)
 
-    assign(term, consoles: consoles)
+    previous_console = current_console(term.assigns)
+    term = assign(term, consoles: consoles)
+
+    if current_console(term.assigns).surface != previous_console.surface,
+      do: assign(term, selecting: false),
+      else: term
   end
 
   defp update_consoles(term, fun) do
@@ -456,7 +480,7 @@ unless System.get_env("BREEZE_VTERM_SKIP_RUN") in ["1", "true", "TRUE"] do
       view: VTermExample,
       alt_screen: true,
       hide_cursor: true,
-      mouse: true,
+      mouse: [mode: :drag],
       child_process_flags: VTermExample.child_process_flags(),
       reload: [paths: ["lib", "examples"]],
       global_keybindings: [{"F10", "Quit", fn _event, term -> {:stop, term} end}]

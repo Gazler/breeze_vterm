@@ -22,6 +22,20 @@ transport and feed its output back through `Breeze.VTerm.write/2`. The component
 provides scrolling and a cursor overlay; the application owns the transport and
 surface updates. Use `Breeze.VTerm.resize/3` when the content dimensions change.
 
+Text selection is opt-in:
+
+```heex
+<.terminal id="console" surface={@surface} selectable br-change="console_input" />
+```
+
+Enable Breeze mouse reporting with `mouse: [mode: :drag]`. Left-drag selects text.
+Each drag movement at or beyond the top or bottom edge scrolls one row in that
+direction and extends the selection. Right-clicking a selection emits
+`%{copy: text}` through `br-change` for the host to write to the clipboard.
+Selection also emits `%{selection: :start}` and `%{selection: :clear}` so the host
+can route keys through Breeze while selecting.
+Typing, Escape, new output, resizing, or disabling `selectable` clears the selection.
+
 This is a small terminal model, not a complete xterm emulator. It supports basic
 cursor movement, erasing, SGR colors, alternate screens, and bounded scrollback.
 Unsupported control sequences are ignored. Applications requiring full-screen
@@ -40,14 +54,19 @@ The example opens a Breeze UI with a console list on the left and a local
 PTY-backed shell on the right. Use the console list to switch focus between
 hosts. When the shell is focused, regular input goes to the shell.
 
+Drag in the terminal pane to select text, including scrolling at either edge.
+Right-click the selection to copy it using the terminal's OSC 52 clipboard support.
+Escape or typing clears the selection.
+
 Useful keys:
 
 - `F10` quits the example.
 - `PageUp` and `PageDown` scroll the terminal buffer.
 - Breeze handles `Ctrl-C` and `Tab` only when the focused shell prompt is
-  empty. `Ctrl-C` quits the app in that state, and `Tab` changes Breeze focus.
-- When the prompt is not empty, or a command is running, `Ctrl-C` and `Tab` are
-  sent to the shell instead.
+  empty and no text is selected. `Ctrl-C` quits the app in that state, and `Tab`
+  changes Breeze focus.
+- When the prompt is not empty, a command is running, or text is selected,
+  `Ctrl-C` and `Tab` are sent to the shell instead.
 
 The local shell transport uses the system `script` executable to create a PTY.
 If the example cannot start a local shell, make sure `script` is installed and
