@@ -16,12 +16,28 @@ defmodule Breeze.VTerm.ComponentsTest do
     end
   end
 
-  test "cursor blink option reaches the static overlay" do
+  test "disabling cursor blinking retains a visible overlay without periodic ticks" do
     {:ok, pid} = ChildServer.start(view: StaticTerminalExample, start_opts: [])
     on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
     assert {:ok, _, _, [decoration]} = ChildServer.render_snapshot(pid, focused: "terminal")
-    assert decoration.every_ms == false
+    assert decoration.every_ms == :change
     assert decoration.state.cursor_blink? == false
+
+    for now <- [1000, 1500] do
+      assert {:ok, _, overlays: [%{visible?: true, char: " ", x: 0, y: 0}]} =
+               Breeze.VTerm.Implicit.animate(
+                 :root,
+                 decoration.box,
+                 decoration.flags,
+                 decoration.state,
+                 %{
+                   layout: decoration.layout,
+                   now: now,
+                   last_interaction_at: now - 10_000,
+                   theme: Breeze.Theme.new(:system16)
+                 }
+               )
+    end
   end
 
   defmodule PromptTerminalExample do

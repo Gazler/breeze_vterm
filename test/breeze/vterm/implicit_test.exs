@@ -222,7 +222,7 @@ defmodule Breeze.VTerm.ImplicitTest do
 
   test "cursor stays visible when blinking is disabled" do
     {:ok, state, meta} = Implicit.init([], %{:"cursor-blink" => false}, %{})
-    assert meta[:rerender_every] == false
+    assert meta[:rerender_every] == :change
 
     for now <- [0, 500, 1000, 1500, 10_500, -1500] do
       assert cursor_visible?(state, now)

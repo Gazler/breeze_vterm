@@ -109,6 +109,7 @@ defmodule VTermExample do
           <.terminal
             id="vterm"
             surface={@current_console.surface}
+            cursor-blink={false}
             br-change="vterm_input"
             class="border focus:border-primary"
             capture_control_keys={@capture_shell_input}

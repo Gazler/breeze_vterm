@@ -28,7 +28,7 @@ defmodule Breeze.VTerm.Implicit do
     meta =
       [
         active_when_focused: true,
-        rerender_every: if(state.cursor_blink?, do: 500, else: false),
+        rerender_every: if(state.cursor_blink?, do: 500, else: :change),
         state_change_requires_rerender: false
       ]
       |> maybe_require_layout_rerender(last_state, state)
