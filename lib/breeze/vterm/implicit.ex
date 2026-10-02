@@ -2,7 +2,6 @@ defmodule Breeze.VTerm.Implicit do
   @moduledoc false
 
   alias Breeze.Implicit.Common
-  alias Breeze.TerminalOverlay
   alias Breeze.Theme
   alias Breeze.Viewport
   alias Breeze.VTerm.Surface
@@ -10,6 +9,10 @@ defmodule Breeze.VTerm.Implicit do
   def init(_children, root_attrs, last_state) do
     state =
       last_state
+      |> Map.put(
+        :cursor_blink?,
+        Map.get(root_attrs, :"cursor-blink", true) not in [false, "false"]
+      )
       |> Map.put(:cols, Map.get(root_attrs, :"terminal-cols"))
       |> Map.put(:rows, Map.get(root_attrs, :"terminal-rows"))
       |> Map.put(:content_height, int_attr(root_attrs, :"terminal-content-height", 0))
@@ -25,7 +28,7 @@ defmodule Breeze.VTerm.Implicit do
     meta =
       [
         active_when_focused: true,
-        rerender_every: 500,
+        rerender_every: if(state.cursor_blink?, do: 500, else: false),
         state_change_requires_rerender: false
       ]
       |> maybe_require_layout_rerender(last_state, state)
@@ -147,7 +150,11 @@ defmodule Breeze.VTerm.Implicit do
       background_color: Theme.color(theme, :cursor) || Theme.color(theme, :accent),
       visible?:
         cursor_visible? and
-          TerminalOverlay.visible?(Map.get(ctx, :now), Map.get(ctx, :last_interaction_at))
+          (not Map.get(state, :cursor_blink?, true) or
+             Breeze.TerminalOverlay.visible?(
+               Map.get(ctx, :now, 0),
+               Map.get(ctx, :last_interaction_at)
+             ))
     }
   end
 

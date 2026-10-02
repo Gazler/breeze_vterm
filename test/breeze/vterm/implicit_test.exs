@@ -220,6 +220,39 @@ defmodule Breeze.VTerm.ImplicitTest do
     assert overlay.visible? == false
   end
 
+  test "cursor stays visible when blinking is disabled" do
+    {:ok, state, meta} = Implicit.init([], %{:"cursor-blink" => false}, %{})
+    assert meta[:rerender_every] == false
+
+    for now <- [0, 500, 1000, 1500, 10_500, -1500] do
+      assert cursor_visible?(state, now)
+    end
+
+    {{:change, _}, updated} = Implicit.handle_event(nil, %{"key" => "x"}, state)
+    assert cursor_visible?(updated, 20_500)
+  end
+
+  test "cursor blinks by default" do
+    {:ok, state, meta} = Implicit.init([], %{}, %{})
+    assert meta[:rerender_every] == 500
+    assert cursor_visible?(state, 1000)
+    refute cursor_visible?(state, 1500)
+  end
+
+  defp cursor_visible?(state, now) do
+    box = %{style: %{border: %{left: false, top: false}, padding_left: 0, padding_top: 0}}
+
+    {:ok, _, overlays: [overlay]} =
+      Implicit.animate(:root, box, [], state, %{
+        layout: viewport(3, 3),
+        now: now,
+        last_interaction_at: now - 10_000,
+        theme: Breeze.Theme.new(:system16)
+      })
+
+    overlay.visible?
+  end
+
   defp viewport(height, content_height) do
     %{
       height: height,

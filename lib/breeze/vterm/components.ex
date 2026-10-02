@@ -9,6 +9,12 @@ defmodule Breeze.VTerm.Components do
 
   attr(:id, :string, required: true)
   attr(:surface, :any, required: true)
+
+  attr(:"cursor-blink", :boolean,
+    default: true,
+    doc: "Set false for a static cursor without blink ticks"
+  )
+
   attr(:capture_breeze_shortcuts, :boolean, default: true)
   attr(:capture_control_keys, :boolean, default: true)
   attr(:capture_focus_keys, :boolean, default: true)
@@ -50,6 +56,7 @@ defmodule Breeze.VTerm.Components do
       implicit={Breeze.VTerm.Implicit}
       class={@class}
       style={Breeze.Blocks.inline_style(assigns)}
+      cursor-blink={boolean_attr(Map.get(assigns, :"cursor-blink", true))}
       terminal-cols={@surface.cols}
       terminal-rows={@surface.rows}
       terminal-content-height={@line_count}

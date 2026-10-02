@@ -3,6 +3,35 @@ defmodule Breeze.VTerm.SurfaceTest do
 
   alias Breeze.VTerm.Surface
 
+  test "virtual slices clip and group cells without copying each input row" do
+    surface = Surface.new(cols: 278, rows: 76)
+    parent = self()
+
+    worker =
+      spawn_link(fn ->
+        receive do
+          :render -> send(parent, {:rows, Surface.virtual_text(surface).slice_fn.(0, 76, 200)})
+        end
+
+        receive do: (:stop -> :ok)
+      end)
+
+    :erlang.trace_pattern({Enum, :take, 2}, true, [:local])
+    :erlang.trace(worker, true, [:call])
+
+    try do
+      send(worker, :render)
+      assert_receive {:rows, rows}, 1000
+      delivery = :erlang.trace_delivered(worker)
+      assert_receive {:trace_delivered, ^worker, ^delivery}
+      assert rows == List.duplicate([{String.duplicate(" ", 200), %{}}], 76)
+      refute_receive {:trace, ^worker, :call, {Enum, :take, _}}, 0
+    after
+      :erlang.trace_pattern({Enum, :take, 2}, false, [:local])
+      send(worker, :stop)
+    end
+  end
+
   test "UTF-8 codepoints survive every byte split" do
     for text <- ["é", "❯", "🍏"], split <- 1..(byte_size(text) - 1) do
       prefix = binary_part(text, 0, split)

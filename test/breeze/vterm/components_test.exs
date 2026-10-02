@@ -4,6 +4,26 @@ defmodule Breeze.VTerm.ComponentsTest do
   alias Breeze.ChildServer
   alias Breeze.VTerm.Surface
 
+  defmodule StaticTerminalExample do
+    use Breeze.View
+    import Breeze.VTerm.Components
+    def mount(_, term), do: {:ok, assign(term, surface: Surface.new(cols: 10, rows: 3))}
+
+    def render(assigns) do
+      ~H"""
+      <.terminal id="terminal" surface={@surface} cursor-blink={false}/>
+      """
+    end
+  end
+
+  test "cursor blink option reaches the static overlay" do
+    {:ok, pid} = ChildServer.start(view: StaticTerminalExample, start_opts: [])
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+    assert {:ok, _, _, [decoration]} = ChildServer.render_snapshot(pid, focused: "terminal")
+    assert decoration.every_ms == false
+    assert decoration.state.cursor_blink? == false
+  end
+
   defmodule PromptTerminalExample do
     use Breeze.View
     import Breeze.VTerm.Components
@@ -299,6 +319,7 @@ defmodule Breeze.VTerm.ComponentsTest do
     assert overlay.x == layout.left + 5
     assert overlay.y == layout.top
     assert overlay.char == " "
+    assert overlay.visible?
   end
 
   defp plain_rows(content) do

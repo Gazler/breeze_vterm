@@ -27,6 +27,8 @@ defmodule Breeze.VTerm.Surface do
             saved_scrollback: nil,
             saved_scrollback_count: 0,
             saved_style: nil,
+            scroll_region: nil,
+            insert_mode?: false,
             alt_screen?: false,
             version: 0
 
@@ -59,6 +61,8 @@ defmodule Breeze.VTerm.Surface do
           saved_scrollback: :queue.queue(row()) | nil,
           saved_scrollback_count: non_neg_integer(),
           saved_style: style() | nil,
+          scroll_region: {non_neg_integer(), non_neg_integer()} | nil,
+          insert_mode?: boolean(),
           alt_screen?: boolean(),
           version: non_neg_integer()
         }
@@ -136,6 +140,7 @@ defmodule Breeze.VTerm.Surface do
         saved_screen_cursor: resize_saved_cursor(surface.saved_screen_cursor, cols, rows),
         version: surface.version + 1
     }
+    |> Map.put(:scroll_region, nil)
   end
 
   @spec input(map() | binary()) :: binary() | nil
@@ -216,8 +221,7 @@ defmodule Breeze.VTerm.Surface do
 
     surface
     |> rows_slice(start_line, count)
-    |> Enum.map(&Enum.take(&1, width))
-    |> Enum.map(&row_segments/1)
+    |> Enum.map(&clipped_row_segments(&1, width, {[], :none, []}))
   end
 
   defp rows_slice(_surface, _start_line, count) when count <= 0, do: []
@@ -283,6 +287,14 @@ defmodule Breeze.VTerm.Surface do
 
   defp consume(surface, <<?\e, ?8, rest::binary>>),
     do: surface |> restore_cursor() |> consume(rest)
+
+  defp consume(surface, <<?\e, ?D, rest::binary>>), do: surface |> linefeed() |> consume(rest)
+
+  defp consume(surface, <<?\e, ?E, rest::binary>>),
+    do: surface |> put_cursor_col(0) |> linefeed() |> consume(rest)
+
+  defp consume(surface, <<?\e, ?M, rest::binary>>),
+    do: surface |> reverse_index() |> consume(rest)
 
   defp consume(surface, <<?\e>>), do: {surface, <<?\e>>}
 
@@ -464,6 +476,12 @@ defmodule Breeze.VTerm.Surface do
     end
   end
 
+  defp apply_csi(surface, params, "@"),
+    do: insert_cells(surface, csi_param(csi_params(params), 0, 1))
+
+  defp apply_csi(surface, params, "P"),
+    do: delete_cells(surface, csi_param(csi_params(params), 0, 1))
+
   defp apply_csi(surface, params, "S") do
     scroll_up(surface, csi_param(csi_params(params), 0, 1))
   end
@@ -471,6 +489,29 @@ defmodule Breeze.VTerm.Surface do
   defp apply_csi(surface, params, "T") do
     scroll_down(surface, csi_param(csi_params(params), 0, 1))
   end
+
+  defp apply_csi(surface, params, "r") do
+    # Private-mode restores and rectangular attribute changes are not DECSTBM.
+    if Regex.match?(~r/^[0-9;]*$/, params) do
+      values = csi_params(params)
+      top = csi_param(values, 0, 1) - 1
+      bottom = csi_param(values, 1, surface.rows) - 1
+
+      if top < bottom and bottom < surface.rows do
+        surface |> Map.put(:scroll_region, {top, bottom}) |> put_cursor(0, 0)
+      else
+        surface
+      end
+    else
+      surface
+    end
+  end
+
+  defp apply_csi(surface, params, "L"),
+    do: edit_lines(surface, csi_param(csi_params(params), 0, 1), :down)
+
+  defp apply_csi(surface, params, "M"),
+    do: edit_lines(surface, csi_param(csi_params(params), 0, 1), :up)
 
   defp apply_csi(surface, _params, _final), do: surface
 
@@ -516,7 +557,9 @@ defmodule Breeze.VTerm.Surface do
     end)
   end
 
-  defp apply_private_mode(surface, _params, _enabled?), do: surface
+  defp apply_private_mode(surface, params, enabled?) do
+    if 4 in csi_params(params), do: Map.put(surface, :insert_mode?, enabled?), else: surface
+  end
 
   defp parse_int(value, default) do
     case Integer.parse(value) do
@@ -643,6 +686,7 @@ defmodule Breeze.VTerm.Surface do
         surface
       end
 
+    surface = maybe_insert_cells(surface, width)
     cell = %{text: grapheme, style: surface.style}
 
     surface =
@@ -672,6 +716,7 @@ defmodule Breeze.VTerm.Surface do
 
         surface =
           surface
+          |> maybe_insert_cells(take)
           |> put_cells(surface.cursor.row, surface.cursor.col, cells, take)
           |> put_cursor_col(surface.cursor.col + take)
 
@@ -683,6 +728,56 @@ defmodule Breeze.VTerm.Surface do
           |> linefeed()
           |> put_ascii_run(rest)
         end
+    end
+  end
+
+  defp maybe_insert_cells(surface, count) do
+    if Map.get(surface, :insert_mode?, false), do: insert_cells(surface, count), else: surface
+  end
+
+  defp insert_cells(surface, count) do
+    col = min(surface.cursor.col, surface.cols)
+    count = min(count, surface.cols - col)
+    row = Enum.at(surface.screen, surface.cursor.row)
+    {before, rest} = Enum.split(row, col)
+    blanks = List.duplicate(%{text: " ", style: surface.style}, count)
+
+    put_row(
+      surface,
+      surface.cursor.row,
+      normalize_edited_row(before ++ blanks ++ Enum.take(rest, length(rest) - count))
+    )
+  end
+
+  defp delete_cells(surface, count) do
+    col = min(surface.cursor.col, surface.cols)
+    count = min(count, surface.cols - col)
+    row = Enum.at(surface.screen, surface.cursor.row)
+    {before, rest} = Enum.split(row, col)
+    blanks = List.duplicate(%{text: " ", style: surface.style}, count)
+
+    put_row(
+      surface,
+      surface.cursor.row,
+      normalize_edited_row(before ++ Enum.drop(rest, count) ++ blanks)
+    )
+  end
+
+  # Character editing uses cell counts. Do not leave half a wide glyph at
+  # an insertion/deletion boundary or at the clipped right edge.
+  defp normalize_edited_row([]), do: []
+
+  defp normalize_edited_row([%{text: ""} = cell | rest]),
+    do: [%{cell | text: " "} | normalize_edited_row(rest)]
+
+  defp normalize_edited_row([cell | rest]) do
+    width = grapheme_width(cell.text)
+    {continuations, tail} = Enum.split(rest, width - 1)
+
+    if length(continuations) == width - 1 and Enum.all?(continuations, &(&1.text == "")) do
+      [cell | continuations] ++ normalize_edited_row(tail)
+    else
+      [%{cell | text: " "} | normalize_edited_row(rest)]
     end
   end
 
@@ -719,44 +814,66 @@ defmodule Breeze.VTerm.Surface do
     %{surface | screen: List.replace_at(surface.screen, row, cells)}
   end
 
+  defp scroll_region(surface), do: Map.get(surface, :scroll_region) || {0, surface.rows - 1}
+
   defp linefeed(surface) do
-    next_row = surface.cursor.row + 1
+    {_top, bottom} = scroll_region(surface)
 
-    if next_row >= surface.rows do
-      [dropped | rest] = surface.screen
+    if surface.cursor.row == bottom,
+      do: scroll_up(surface, 1),
+      else: put_cursor_row(surface, surface.cursor.row + 1)
+  end
 
-      %{
-        surface
-        | cursor: %{surface.cursor | row: surface.rows - 1},
-          screen: rest ++ [blank_row(surface.cols)]
-      }
-      |> push_scrollback(dropped)
-    else
-      put_cursor_row(surface, next_row)
-    end
+  defp reverse_index(surface) do
+    {top, _bottom} = scroll_region(surface)
+
+    if surface.cursor.row == top,
+      do: scroll_down(surface, 1),
+      else: put_cursor_row(surface, surface.cursor.row - 1)
   end
 
   defp scroll_up(surface, count) do
-    count = clamp(count, 0, surface.rows)
-    {dropped, rest} = Enum.split(surface.screen, count)
-
-    %{
-      surface
-      | screen: rest ++ repeat(count, fn -> blank_row(surface.cols) end)
-    }
-    |> append_scrollback(dropped)
+    {top, bottom} = scroll_region(surface)
+    shift_rows(surface, top, bottom, count, :up, top == 0 and bottom == surface.rows - 1)
   end
 
   defp scroll_down(surface, count) do
-    count = clamp(count, 0, surface.rows)
-    keep = max(surface.rows - count, 0)
+    {top, bottom} = scroll_region(surface)
+    shift_rows(surface, top, bottom, count, :down, false)
+  end
 
-    %{
+  defp edit_lines(surface, count, direction) do
+    {top, bottom} = scroll_region(surface)
+    row = surface.cursor.row
+
+    if row >= top and row <= bottom do
+      surface |> shift_rows(row, bottom, count, direction, false) |> put_cursor_col(0)
+    else
       surface
-      | screen:
-          repeat(count, fn -> blank_row(surface.cols) end) ++
-            Enum.take(surface.screen, keep)
-    }
+    end
+  end
+
+  defp shift_rows(surface, top, bottom, count, direction, history?) do
+    height = bottom - top + 1
+    count = clamp(count, 0, height)
+    {before, rest} = Enum.split(surface.screen, top)
+    {region, after_region} = Enum.split(rest, height)
+
+    blanks =
+      repeat(count, fn -> List.duplicate(%{text: " ", style: surface.style}, surface.cols) end)
+
+    {shifted, dropped} =
+      case direction do
+        :up ->
+          {dropped, kept} = Enum.split(region, count)
+          {kept ++ blanks, dropped}
+
+        :down ->
+          {blanks ++ Enum.take(region, height - count), []}
+      end
+
+    surface = %{surface | screen: before ++ shifted ++ after_region}
+    if history?, do: append_scrollback(surface, dropped), else: surface
   end
 
   defp clear_from_cursor(surface) do
@@ -839,6 +956,40 @@ defmodule Breeze.VTerm.Surface do
     |> finish_row_segments()
   end
 
+  # Clip in cell coordinates while grouping styles, including wide-glyph
+  # continuation cells in the limit but not in the rendered text.
+  defp clipped_row_segments(_, 0, acc), do: finish_row_segments(acc)
+  defp clipped_row_segments([], _, acc), do: finish_row_segments(acc)
+
+  defp clipped_row_segments([%{text: ""} | rest], remaining, acc),
+    do: clipped_row_segments(rest, remaining - 1, acc)
+
+  defp clipped_row_segments(
+         [%{text: text, style: style} | rest],
+         remaining,
+         {segments, style, parts}
+       ),
+       do: clipped_row_segments(rest, remaining - 1, {segments, style, [text | parts]})
+
+  defp clipped_row_segments(
+         [%{text: text, style: style} | rest],
+         remaining,
+         {segments, :none, []}
+       ),
+       do: clipped_row_segments(rest, remaining - 1, {segments, style, [text]})
+
+  defp clipped_row_segments(
+         [%{text: text, style: style} | rest],
+         remaining,
+         {segments, previous, parts}
+       ),
+       do:
+         clipped_row_segments(
+           rest,
+           remaining - 1,
+           {[{parts_to_binary(parts), previous} | segments], style, [text]}
+         )
+
   defp finish_row_segments({segments, :none, []}), do: Enum.reverse(segments)
 
   defp finish_row_segments({segments, style, parts}),
@@ -907,6 +1058,8 @@ defmodule Breeze.VTerm.Surface do
   defp ascii_cells(bytes, style), do: for(<<char <- bytes>>, do: %{text: <<char>>, style: style})
 
   defp append_scrollback(surface, rows), do: Enum.reduce(rows, surface, &push_scrollback(&2, &1))
+
+  defp push_scrollback(%{alt_screen?: true} = surface, _row), do: surface
 
   defp push_scrollback(%{scrollback_limit: 0} = surface, _row),
     do: %{surface | scrollback: :queue.new(), scrollback_count: 0}
