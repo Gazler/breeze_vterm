@@ -479,6 +479,16 @@ defmodule VTermExample do
 end
 
 unless System.get_env("BREEZE_VTERM_SKIP_RUN") in ["1", "true", "TRUE"] do
+  frame_opts =
+    if System.get_env("BREEZE_VTERM_DIFF_FRAME") in ["1", "true", "TRUE"] do
+      unless Map.has_key?(%Breeze.Server.State.Frame{}, :renderer),
+        do: raise("Requires Breeze with frame_renderer support; update the dependency first")
+
+      [frame_renderer: Breeze.VTerm.Frame]
+    else
+      []
+    end
+
   Breeze.Example.run(
     [
       view: VTermExample,
@@ -488,7 +498,7 @@ unless System.get_env("BREEZE_VTERM_SKIP_RUN") in ["1", "true", "TRUE"] do
       child_process_flags: VTermExample.child_process_flags(),
       reload: [paths: ["lib", "examples"]],
       global_keybindings: [{"F10", "Quit", fn _event, term -> {:stop, term} end}]
-    ],
+    ] ++ frame_opts,
     keep_alive: :infinity
   )
 end

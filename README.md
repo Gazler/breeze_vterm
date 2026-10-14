@@ -208,3 +208,47 @@ both versions must produce the same final cells for each benchmark workload.
 These are local observations, not performance guarantees. The shared conformance
 suite currently checks 34 streams in both chunkings; it is not a full libvterm
 conformance suite.
+
+### Experimental cell-diff frame renderer
+
+`Breeze.VTerm.Frame` now composes base text, selection and cursor overlays before
+comparing cells. It sends changed spans, keeps wide glyph boundaries intact, and
+preserves the original writer's final cursor and delayed-wrap state. Supported
+SGR sequences are retained verbatim, including attributes outside Surface's
+smaller terminal model. Repeated row transitions use BackBreeze's bounded render
+cache. Identical frames return immediately.
+
+Initial paints, complex graphemes, control strings, clipped overlays, overlays
+that split a wide glyph, and other unsupported cases use the existing writer.
+The renderer also keeps the existing payload whenever the candidate is larger.
+Short vertical shifts can use terminal scrolling commands, followed by repairs
+to exposed rows, highlights and surrounding UI. The smallest supported payload
+wins. Output styling is not retained between frames. This remains an opt-in
+experiment with a server CPU/bandwidth tradeoff.
+
+The integration belongs before the terminal adapter writes to SSH. Breeze's
+per-session `:frame_renderer` option handles complete frames and live child
+updates. The configured Git dependency includes the frame-renderer,
+compact-snapshot and asynchronous focus changes. The unmodified 0.5.5 release
+does not include them:
+
+```elixir
+{:breeze, git: "https://github.com/Gazler/breeze.git", branch: "perf/scroll-patches"}
+```
+
+```sh
+mix deps.get
+mix deps.compile breeze
+BREEZE_VTERM_DIFF_FRAME=1 mix run examples/vterm.exs
+```
+
+Compact snapshots improve scrolling with either frame writer. Keep the
+application's existing SSH terminal adapter and add the renderer option:
+
+```elixir
+Breeze.Server.start_link(
+  view: MyApp.View,
+  terminal: ssh_terminal,
+  frame_renderer: Breeze.VTerm.Frame
+)
+```
