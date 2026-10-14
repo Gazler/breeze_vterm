@@ -254,9 +254,12 @@ defmodule Breeze.VTerm.Surface do
     |> Enum.map(&clipped_row_segments(&1, width, {[], :none, []}))
   end
 
-  defp rows_slice(_surface, _start_line, count) when count <= 0, do: []
+  # Internal cell access for selection; rows are scrollback followed by the screen.
+  @doc false
+  @spec rows_slice(t(), integer(), integer()) :: [row()]
+  def rows_slice(_surface, _start_line, count) when count <= 0, do: []
 
-  defp rows_slice(surface, start_line, count) do
+  def rows_slice(surface, start_line, count) do
     start_line = max(start_line, 0)
     scrollback_count = surface.scrollback_count
 
