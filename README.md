@@ -2,7 +2,9 @@
 
 Virtual terminal components for Breeze applications.
 
-Requires Elixir 1.18 or newer and Breeze 0.5.3.
+Requires Elixir 1.18 or newer. Breeze is pinned in `mix.lock` to the
+[`perf/scroll-patches` branch](https://github.com/Gazler/breeze/tree/perf/scroll-patches),
+which provides the frame renderer and compact animation snapshots.
 
 ## Using a Surface
 
