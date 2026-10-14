@@ -16,6 +16,11 @@ defmodule Breeze.VTerm.Frame do
   Like Breeze's frame writer, this assumes ownership of the complete terminal
   with normal origin mode and full-screen scrolling margins between frames.
 
+  Nonempty frames are enclosed in synchronized-output markers (DEC mode 2026).
+  Supporting terminals display the scroll and its repairs together, even when
+  transport chunks arrive separately. This adds 16 bytes per frame; idle frames
+  remain empty. Initial paints and fallback redraws use the same markers.
+
   Initial paints and unsupported content use Breeze's existing frame writer.
   Supported rows contain printable single codepoints and SGR styling, ending in
   the default style. Wide glyphs are kept intact. Control strings, other cursor
@@ -37,15 +42,24 @@ defmodule Breeze.VTerm.Frame do
   def build_payload(previous, lines, previous_overlays, overlays, width, opts) do
     original = Legacy.build_payload(previous, lines, previous_overlays, overlays, width)
 
-    if is_list(previous) and length(previous) == length(lines) and original != "" do
-      case diff(previous, lines, previous_overlays, overlays, width, original, opts) do
-        {:ok, candidate} when byte_size(candidate) < byte_size(original) -> candidate
-        _ -> original
+    payload =
+      if is_list(previous) and length(previous) == length(lines) and original != "" do
+        case diff(previous, lines, previous_overlays, overlays, width, original, opts) do
+          {:ok, candidate} when byte_size(candidate) < byte_size(original) -> candidate
+          _ -> original
+        end
+      else
+        original
       end
-    else
-      original
-    end
+
+    synchronize(payload)
   end
+
+  defp synchronize(""), do: ""
+
+  # Enclose the completed payload in one adapter write. A terminal may paint
+  # between the scroll command and its repairs even when sent in one write.
+  defp synchronize(payload), do: "\e[?2026h" <> payload <> "\e[?2026l"
 
   defp diff(previous, lines, previous_overlays, overlays, width, original, opts) do
     with {:ok, old_overlays} <- group_overlays(previous_overlays, width, length(lines)),

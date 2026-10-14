@@ -77,6 +77,8 @@ defmodule Breeze.VTerm.FrameIntegrationTest do
     previous = :sys.get_state(pid)
     Breeze.ChildServer.dispatch_info(child, :edit, terminal)
     assert_receive {:frame_bytes, delta}, 2_000
+    assert String.starts_with?(delta, "\e[?2026h")
+    assert String.ends_with?(delta, "\e[?2026l")
     state = :sys.get_state(pid)
     assert state.debug.stats.last_render_cause == :child_patch
 

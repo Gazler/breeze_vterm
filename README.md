@@ -226,6 +226,15 @@ to exposed rows, highlights and surrounding UI. The smallest supported payload
 wins. Output styling is not retained between frames. This remains an opt-in
 experiment with a server CPU/bandwidth tradeoff.
 
+Every nonempty frame, including initial paints and fallback redraws, is enclosed
+in synchronized-output markers (`CSI ? 2026 h` / `CSI ? 2026 l`). This lets
+supporting terminals such as Ghostty display the scroll and its repairs together
+instead of painting an intermediate state. Both markers travel with the completed
+frame in the same adapter write; idle frames still send nothing. See
+[Ghostty's synchronized-output guidance](https://ghostty.org/docs/help/synchronized-output).
+This adds 16 ANSI bytes per frame before SSH overhead. The historical payload
+tables below predate these markers; copied clipboard text is unchanged.
+
 The integration belongs before the terminal adapter writes to SSH. Breeze's
 per-session `:frame_renderer` option handles complete frames and live child
 updates. The configured Git dependency includes the frame-renderer,
