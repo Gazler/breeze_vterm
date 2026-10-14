@@ -38,6 +38,28 @@ Selection also emits `%{selection: :start}` and `%{selection: :clear}` so the ho
 can route keys through Breeze while selecting.
 Typing, Escape, new output, resizing, or disabling `selectable` clears the selection.
 
+The terminal core is pure Elixir, with selected parser and terminal-state behavior
+ported from [libvterm 0.3.3](https://www.leonerd.org.uk/code/libvterm/). There is no
+NIF or native runtime dependency. Attribution and the upstream MIT license are in
+[bench/THIRD_PARTY_NOTICES](bench/THIRD_PARTY_NOTICES).
+
+The port covers streaming ESC/CSI parsing, control-string consumption, delayed
+wrapping and DECAWM, origin mode and scrolling margins, configurable tab stops,
+cursor/pen save and restore, newline mode, color-preserving erasure, and character
+and line editing. SGR supports indexed/RGB colors, bold, italic, and inverse.
+The component honors cursor visibility and application cursor-key mode. Alternate
+screens and bounded scrollback remain available.
+
+Use `Breeze.VTerm.input(surface, event)` when encoding keys directly, so arrows,
+Home, and End honor application cursor mode. The component does this automatically;
+`input(event)` remains available for stateless encoding.
+
+This is a selected subset, not full libvterm/xterm compatibility. Legacy
+character sets, mouse reporting to child applications, graphics,
+and complete Unicode grapheme handling are outside this port. Unsupported
+commands are ignored. Existing alternate-screen and resize policies are retained;
+the comparison below does not establish parity for those operations.
+
 ### Terminal query replies
 
 Programs such as `gh` query the terminal's background color and may pause until
@@ -72,11 +94,6 @@ available. The fallback is a light foreground `{229, 229, 229}` on black
 Replies are disabled unless `:on_reply` is set. When adopting this callback in an
 application that already answers color queries, remove its separate responder
 to avoid sending duplicate replies. Other terminal queries remain unsupported.
-
-This is a small terminal model, not a complete xterm emulator. It supports basic
-cursor movement, erasing, SGR colors, alternate screens, and bounded scrollback.
-Unsupported control sequences are ignored. Applications requiring full-screen
-terminal compatibility should validate their command set before adopting it.
 
 ## Running the Example
 
@@ -118,8 +135,9 @@ resizes, including notifying nested terminal applications. Applications using
 
 The surface buffers incomplete UTF-8 codepoints (at most three bytes) and discards
 malformed bytes. OSC parsing retains at most four bytes to recognize supported
-color queries; other payloads are discarded incrementally. CSI parameter data
-is limited to 256 bytes; overlong sequences are ignored through their final byte.
+color queries; other OSC/DCS/APC/PM/SOS payloads are discarded incrementally.
+ESC intermediates and CSI sequence data are limited to 256 bytes; overlong
+sequences are ignored through their final byte.
 
 `LocalShell` sends `{:vterm_output, id, bytes}`. Process the bytes directly:
 
@@ -148,3 +166,60 @@ ITERATIONS=30 PREFILL_LINES=2000 mix run bench/vterm_benchmark.exs
 The surface benchmark reports median time and reductions over five samples for
 prompt editing, styled output, and bulk output. The full benchmark also measures
 Breeze layout and rendering, using the demo without starting shell processes.
+
+### Comparing with libvterm
+
+The optional reference harness compiles libvterm 0.3.3 as a separate executable.
+It compares text, supported styles, and cursor position for the shared fixtures,
+feeding both complete streams and individual bytes. Regular `mix test` exercises
+the port without requiring C, and checks every two-part split of those fixtures.
+
+Download and unpack the [0.3.3 source release](https://www.leonerd.org.uk/code/libvterm/libvterm-0.3.3.tar.gz),
+then run with a C compiler available:
+
+```sh
+LIBVTERM_SRC=/path/to/libvterm-0.3.3 mix run bench/libvterm_benchmark.exs
+LIBVTERM_SRC=/path/to/libvterm-0.3.3 CHECK_ONLY=1 mix run bench/libvterm_benchmark.exs
+BASELINE_REF=5bac356 LIBVTERM_SRC=/path/to/libvterm-0.3.3 SAMPLES=7 mix run bench/libvterm_benchmark.exs
+```
+
+The timing comparison uses identical streams and dimensions with scrollback
+disabled on both sides. It reports median time per write over five samples, and
+checks the final screens of the repeated workloads outside the timed region.
+Compilation, process startup, construction, file I/O, and snapshot extraction are
+excluded. This measures parsing and screen updates; Breeze rendering, selection,
+PTY transport, and any prospective NIF/Port integration overhead are excluded.
+The two implementations retain their own screen representations, so results are
+workload-dependent and are not a general comparison of language speed.
+
+Defaults are `SIZES=120x40,400x120`, `ITERATIONS=10000` for short writes,
+100 iterations for full-screen repainting, 10 for bulk output, and `SAMPLES=5`.
+Override `CC` to select the compiler. C is built with `-O2`.
+
+Intentional differences from the reference include bounded parsing, discarding
+malformed UTF-8 instead of emitting replacement characters, and correctly handling
+the omitted color-space field in `38:2::r:g:b` (misread by libvterm 0.3.3).
+
+Before/after measurements on an Intel Core Ultra X7 358H, Elixir 1.20.4 / OTP 29,
+GCC 16.2.1 `-O2` (2026-10-13, seven samples; microseconds per write).
+These recorded measurements used the original pre-port selection sources from
+`f9acdcd008588c73a2af99d450b27f38f635452d`. The benchmark now defaults to the
+rebased selection commit `5bac356f3f4097117049e175f09fc131bf13121c`, which also
+includes terminal query replies. Its Surface is compiled into a separate namespace
+using the same current dependencies. Before/after timing order alternates by
+sample; both versions must produce the same final cells for each workload.
+
+| Size | Workload | Bytes/write | Before | After | libvterm C |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 120×40 | Prompt editing | 4 | 0.629 | 0.909 | 0.056 |
+| 120×40 | Styled scrolling line | 22 | 2.663 | 3.432 | 2.393 |
+| 120×40 | Full-screen repaint | 4,803 | 195.17 | 179.91 | 62.87 |
+| 120×40 | Bulk scrolling | 120,000 | 7,400.70 | 6,713.00 | 3,408.93 |
+| 400×120 | Prompt editing | 4 | 2.471 | 2.966 | 0.053 |
+| 400×120 | Styled scrolling line | 22 | 20.780 | 22.492 | 24.376 |
+| 400×120 | Full-screen repaint | 48,003 | 2,773.76 | 2,166.83 | 434.31 |
+| 400×120 | Bulk scrolling | 400,000 | 34,676.70 | 23,536.80 | 27,603.29 |
+
+These are local observations, not performance guarantees. The shared conformance
+suite currently checks 34 streams in both chunkings; it is not a full libvterm
+conformance suite.

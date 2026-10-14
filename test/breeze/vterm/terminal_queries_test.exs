@@ -77,6 +77,7 @@ defmodule Breeze.VTerm.TerminalQueriesTest do
           "\e]11;?" <> <<26>>,
           "\e]11;?\e" <> <<24>>,
           "\e]11;?\eX\a",
+          "\e]11;?\e\e\\",
           "\e]11;?x\a",
           "\e]11;\a",
           "\e]11;rgb:ffff/ffff/ffff\a",
@@ -153,5 +154,46 @@ defmodule Breeze.VTerm.TerminalQueriesTest do
         value <- [nil, 7, "#ffffff", {256, 0, 0}, {0, -1, 0}, {0, 0, 1.5}] do
       assert_raise ArgumentError, ~r/RGB tuple/, fn -> VTerm.new([{key, value}]) end
     end
+  end
+
+  test "split color and cursor queries preserve pending wrapping" do
+    queries = "\e]10;?\e\\\e[6n"
+
+    for split <- 0..byte_size(queries) do
+      surface =
+        VTerm.new(cols: 4, rows: 2, on_reply: &send(self(), {:reply, &1}))
+        |> VTerm.write("abcd")
+        |> VTerm.write(binary_part(queries, 0, split))
+        |> VTerm.write(binary_part(queries, split, byte_size(queries) - split))
+
+      assert_receive {:reply, "\e]10;rgb:e5e5/e5e5/e5e5\e\\"}
+      assert_receive {:reply, "\e[1;4R"}
+      refute_receive {:reply, _}, 0
+      assert surface.wrap_pending?
+      assert surface.cursor == %{row: 0, col: 3}
+      assert Surface.lines(VTerm.write(surface, "X")) == ["abcd", "X   "]
+    end
+  end
+
+  test "terminal reset retains the reply callback and configured default colors" do
+    original =
+      VTerm.new(
+        cols: 4,
+        rows: 2,
+        foreground_color: {1, 2, 3},
+        background_color: {4, 5, 6},
+        on_reply: &send(self(), {:reply, &1})
+      )
+
+    surface =
+      VTerm.write(original, "abcd\ec\e]10;?\a\e]11;?\e\\\e[6nZ")
+
+    assert_receive {:reply, "\e]10;rgb:0101/0202/0303\a"}
+    assert_receive {:reply, "\e]11;rgb:0404/0505/0606\e\\"}
+    assert_receive {:reply, "\e[1;1R"}
+    refute_receive {:reply, _}, 0
+    assert surface.id == original.id
+    assert surface.on_reply == original.on_reply
+    assert Surface.lines(surface) == ["Z   ", "    "]
   end
 end
