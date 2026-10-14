@@ -3,12 +3,16 @@ defmodule Breeze.VTerm.Surface do
   A small terminal screen model for embedding terminal-like byte streams in Breeze.
 
   The surface is transport agnostic: callers feed output bytes with `write/2`,
-  forward encoded input bytes from `input/1` to their backend, and render the
+  forward encoded input bytes from `input/2` to their backend, and render the
   current screen with `virtual_text/1`.
   """
 
   alias BackBreeze.Ucwidth
   alias BackBreeze.VirtualText
+  alias Breeze.VTerm.Parser
+
+  # Terminal semantics adapted from libvterm 0.3.3 src/state.c and src/screen.c.
+  # See THIRD_PARTY_NOTICES for attribution and the MIT license.
 
   defstruct id: nil,
             cols: 80,
@@ -22,6 +26,15 @@ defmodule Breeze.VTerm.Surface do
             buffer: "",
             parser_state: :ground,
             saved_cursor: nil,
+            saved_cursor_style: %{},
+            saved_cursor_visible?: true,
+            tabstops: MapSet.new(),
+            origin_mode?: false,
+            autowrap?: true,
+            wrap_pending?: false,
+            newline_mode?: false,
+            cursor_visible?: true,
+            application_cursor?: false,
             saved_screen_cursor: nil,
             saved_screen: nil,
             saved_scrollback: nil,
@@ -53,8 +66,16 @@ defmodule Breeze.VTerm.Surface do
           scrollback: :queue.queue(row()),
           scrollback_count: non_neg_integer(),
           buffer: binary(),
-          parser_state:
-            :ground | :osc | :osc_escape | :discard_csi | {:csi, [byte()], non_neg_integer()},
+          parser_state: atom() | tuple(),
+          tabstops: MapSet.t(non_neg_integer()),
+          origin_mode?: boolean(),
+          autowrap?: boolean(),
+          wrap_pending?: boolean(),
+          newline_mode?: boolean(),
+          cursor_visible?: boolean(),
+          application_cursor?: boolean(),
+          saved_cursor_style: style(),
+          saved_cursor_visible?: boolean(),
           saved_cursor: %{row: non_neg_integer(), col: non_neg_integer()} | nil,
           saved_screen_cursor: %{row: non_neg_integer(), col: non_neg_integer()} | nil,
           saved_screen: [row()] | nil,
@@ -69,7 +90,6 @@ defmodule Breeze.VTerm.Surface do
 
   @ansi_8_color_count 8
   @default_scrollback_limit 10_000
-  @max_csi_bytes 256
 
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
@@ -91,6 +111,7 @@ defmodule Breeze.VTerm.Surface do
       rows: rows,
       scrollback_limit: scrollback_limit,
       screen: blank_screen(cols, rows),
+      tabstops: default_tabstops(cols),
       scrollback: :queue.new(),
       scrollback_count: 0,
       cursor: %{row: 0, col: 0}
@@ -99,8 +120,8 @@ defmodule Breeze.VTerm.Surface do
 
   @spec write(t(), binary()) :: t()
   def write(%__MODULE__{} = surface, bytes) when is_binary(bytes) do
-    {surface, buffer} = consume(%{surface | buffer: ""}, surface.buffer <> bytes)
-    %{surface | buffer: :binary.copy(buffer), version: surface.version + 1}
+    {state, surface} = Parser.feed(surface.parser_state, bytes, surface, &apply_event/2)
+    %{surface | parser_state: state, version: surface.version + 1}
   end
 
   @spec resize(t(), pos_integer(), pos_integer()) :: t()
@@ -131,6 +152,8 @@ defmodule Breeze.VTerm.Surface do
       | cols: cols,
         rows: rows,
         screen: screen,
+        wrap_pending?: false,
+        tabstops: resize_tabstops(surface, cols),
         cursor: %{
           row: min(surface.cursor.row, rows - 1),
           col: min(surface.cursor.col, cols - 1)
@@ -179,6 +202,22 @@ defmodule Breeze.VTerm.Surface do
   end
 
   def input(_event), do: nil
+
+  @doc "Encodes a key using the terminal's current cursor-key mode."
+  @spec input(t() | nil, map() | binary()) :: binary() | nil
+  def input(%{application_cursor?: true}, event) do
+    key = if is_map(event), do: Map.get(event, "key"), else: event
+    modified? = is_map(event) and (event["ctrlKey"] == true or event["altKey"] == true)
+
+    if not modified? and key in ["ArrowUp", "ArrowDown", "ArrowRight", "ArrowLeft", "Home", "End"] do
+      "\e[" <> suffix = input(key)
+      "\eO" <> suffix
+    else
+      input(event)
+    end
+  end
+
+  def input(_surface, event), do: input(event)
 
   @spec virtual_text(t()) :: VirtualText.t()
   def virtual_text(%__MODULE__{} = surface) do
@@ -255,111 +294,73 @@ defmodule Breeze.VTerm.Surface do
     :queue.to_list(slice)
   end
 
-  defp consume(%{parser_state: :osc} = surface, bytes), do: consume_osc(surface, bytes)
-
-  defp consume(%{parser_state: :osc_escape} = surface, ""), do: {surface, ""}
-
-  defp consume(%{parser_state: :osc_escape} = surface, <<?\\, rest::binary>>),
-    do: consume(%{surface | parser_state: :ground}, rest)
-
-  defp consume(%{parser_state: :osc_escape} = surface, bytes),
-    do: consume_osc(%{surface | parser_state: :osc}, bytes)
-
-  defp consume(%{parser_state: {:csi, params, count}} = surface, bytes),
-    do: consume_csi(surface, bytes, params, count)
-
-  defp consume(%{parser_state: :discard_csi} = surface, bytes),
-    do: consume_csi(surface, bytes, [], @max_csi_bytes + 1)
-
-  defp consume(surface, ""), do: {surface, ""}
-
-  defp consume(surface, <<?\e, ?[, rest::binary>>),
-    do: consume_csi(surface, rest, [], 0)
-
-  defp consume(surface, <<?\e, ?], rest::binary>>),
-    do: consume_osc(surface, rest)
-
-  defp consume(surface, <<?\e, charset>>) when charset in [?(, ?)],
-    do: {surface, <<?\e, charset>>}
-
-  defp consume(surface, <<?\e, ?(, _charset, rest::binary>>), do: consume(surface, rest)
-  defp consume(surface, <<?\e, ?), _charset, rest::binary>>), do: consume(surface, rest)
-  defp consume(surface, <<?\e, ?7, rest::binary>>), do: surface |> save_cursor() |> consume(rest)
-
-  defp consume(surface, <<?\e, ?8, rest::binary>>),
-    do: surface |> restore_cursor() |> consume(rest)
-
-  defp consume(surface, <<?\e, ?D, rest::binary>>), do: surface |> linefeed() |> consume(rest)
-
-  defp consume(surface, <<?\e, ?E, rest::binary>>),
-    do: surface |> put_cursor_col(0) |> linefeed() |> consume(rest)
-
-  defp consume(surface, <<?\e, ?M, rest::binary>>),
-    do: surface |> reverse_index() |> consume(rest)
-
-  defp consume(surface, <<?\e>>), do: {surface, <<?\e>>}
-
-  defp consume(surface, <<?\e, _ignored, rest::binary>>) do
-    consume(surface, rest)
+  defp apply_event({:text, bytes}, surface) do
+    consume_text(%{surface | buffer: ""}, surface.buffer <> bytes)
   end
 
-  defp consume(surface, <<?\r, rest::binary>>) do
-    surface
-    |> put_cursor_col(0)
-    |> consume(rest)
+  defp apply_event(event, surface) do
+    # A control interrupts an unfinished UTF-8 character.
+    apply_terminal_event(event, %{surface | buffer: ""})
   end
 
-  defp consume(surface, <<?\n, rest::binary>>) do
-    surface
-    |> linefeed()
-    |> consume(rest)
+  defp apply_terminal_event({:control, 8}, surface),
+    do: put_cursor_col(surface, surface.cursor.col - 1)
+
+  defp apply_terminal_event({:control, 9}, surface), do: tab(surface, 1, :forward)
+
+  defp apply_terminal_event({:control, c}, surface) when c in [10, 11, 12] do
+    surface = linefeed(surface)
+    if surface.newline_mode?, do: put_cursor_col(surface, 0), else: surface
   end
 
-  defp consume(surface, <<?\b, rest::binary>>) do
-    surface
-    |> put_cursor_col(max(surface.cursor.col - 1, 0))
-    |> consume(rest)
+  defp apply_terminal_event({:control, 13}, surface), do: put_cursor_col(surface, 0)
+  defp apply_terminal_event({:control, 0x84}, surface), do: linefeed(surface)
+
+  defp apply_terminal_event({:control, 0x85}, surface),
+    do: surface |> linefeed() |> put_cursor_col(0)
+
+  defp apply_terminal_event({:control, 0x88}, surface),
+    do: %{surface | tabstops: MapSet.put(surface.tabstops, surface.cursor.col)}
+
+  defp apply_terminal_event({:control, 0x8D}, surface), do: reverse_index(surface)
+  defp apply_terminal_event({:escape, "7"}, surface), do: save_cursor(surface)
+  defp apply_terminal_event({:escape, "8"}, surface), do: restore_cursor(surface)
+
+  defp apply_terminal_event({:escape, "c"}, surface) do
+    fresh =
+      new(cols: surface.cols, rows: surface.rows, scrollback_limit: surface.scrollback_limit)
+
+    %{fresh | id: surface.id, version: surface.version}
   end
 
-  defp consume(surface, <<?\t, rest::binary>>) do
-    spaces = 8 - rem(surface.cursor.col, 8)
-
-    surface =
-      Enum.reduce(1..spaces, surface, fn _index, acc ->
-        put_grapheme(acc, " ")
-      end)
-
-    consume(surface, rest)
+  # Dispatch on the complete command, not just its final byte. For example,
+  # DECCARA ($r) must never be mistaken for scrolling margins (r).
+  defp apply_terminal_event({:csi, "", params, "", final}, surface) do
+    if final == "m" or not String.contains?(params, ":"),
+      do: apply_csi(surface, params, final),
+      else: surface
   end
 
-  # Controls such as the shell's backspace bell must never reach rendered text.
-  defp consume(surface, <<char, rest::binary>>) when char < 0x20 or char == 0x7F,
-    do: consume(surface, rest)
+  defp apply_terminal_event({:csi, "?", params, "", final}, surface) when final in ["h", "l"],
+    do: apply_private_mode(surface, "?" <> params, final == "h")
 
-  defp consume(surface, <<char, _rest::binary>> = bytes) when char in 0x20..0x7E do
+  defp apply_terminal_event(_event, surface), do: surface
+
+  defp consume_text(surface, ""), do: surface
+
+  defp consume_text(surface, <<char, _::binary>> = bytes) when char in 0x20..0x7E do
     {run, rest} = take_printable_ascii(bytes)
-
-    surface
-    |> put_ascii_run(run)
-    |> consume(rest)
+    surface |> put_ascii_run(run) |> consume_text(rest)
   end
 
-  # UTF-8 encoded C1 controls are not printable text either.
-  defp consume(surface, <<0xC2, char, rest::binary>>) when char in 0x80..0x9F,
-    do: consume(surface, rest)
+  defp consume_text(surface, <<0xC2, char, rest::binary>>) when char in 0x80..0x9F,
+    do: consume_text(surface, rest)
 
-  defp consume(surface, bytes) do
+  defp consume_text(surface, bytes) do
     case next_grapheme(bytes) do
-      {:ok, grapheme, rest} ->
-        surface
-        |> put_grapheme(grapheme)
-        |> consume(rest)
-
-      :incomplete ->
-        {surface, bytes}
-
-      {:drop, rest} ->
-        consume(surface, rest)
+      {:ok, grapheme, rest} -> surface |> put_grapheme(grapheme) |> consume_text(rest)
+      :incomplete -> %{surface | buffer: :binary.copy(bytes)}
+      {:drop, rest} -> consume_text(surface, rest)
     end
   end
 
@@ -369,57 +370,8 @@ defmodule Breeze.VTerm.Surface do
        when char in 0x20..0x7E,
        do: do_take_printable_ascii(original, rest, count + 1)
 
-  defp do_take_printable_ascii(_original, rest, 0), do: {"", rest}
-
-  defp do_take_printable_ascii(original, rest, count) do
-    run = binary_part(original, 0, count)
-    {run, rest}
-  end
-
-  # OSC payloads are unsupported: discard as they arrive, retaining only whether
-  # an ESC might be the first half of a split string terminator.
-  defp consume_osc(surface, ""), do: {%{surface | parser_state: :osc}, ""}
-
-  defp consume_osc(surface, <<char, rest::binary>>) when char in [7, 24, 26],
-    do: consume(%{surface | parser_state: :ground}, rest)
-
-  defp consume_osc(surface, <<?\e, rest::binary>>),
-    do: consume(%{surface | parser_state: :osc_escape}, rest)
-
-  defp consume_osc(surface, <<_char, rest::binary>>), do: consume_osc(surface, rest)
-
-  defp consume_csi(surface, "", _params, count) when count > @max_csi_bytes,
-    do: {%{surface | parser_state: :discard_csi}, ""}
-
-  defp consume_csi(surface, "", params, count),
-    do: {%{surface | parser_state: {:csi, params, count}}, ""}
-
-  defp consume_csi(surface, <<?\e, _::binary>> = bytes, _params, _count),
-    do: consume(%{surface | parser_state: :ground}, bytes)
-
-  defp consume_csi(surface, <<char, rest::binary>>, _params, _count) when char in [24, 26],
-    do: consume(%{surface | parser_state: :ground}, rest)
-
-  defp consume_csi(surface, <<final, rest::binary>>, params, count) when final in 0x40..0x7E do
-    surface = %{surface | parser_state: :ground}
-
-    surface =
-      if count <= @max_csi_bytes do
-        apply_csi(surface, params |> Enum.reverse() |> :erlang.list_to_binary(), <<final>>)
-      else
-        surface
-      end
-
-    consume(surface, rest)
-  end
-
-  defp consume_csi(surface, <<char, rest::binary>>, params, count)
-       when char in 0x20..0x3F and count < @max_csi_bytes,
-       do: consume_csi(surface, rest, [char | params], count + 1)
-
-  # Overlong or malformed CSI sequences remain discarded through their final byte.
-  defp consume_csi(surface, <<_char, rest::binary>>, _params, _count),
-    do: consume_csi(surface, rest, [], @max_csi_bytes + 1)
+  defp do_take_printable_ascii(original, rest, count),
+    do: {binary_part(original, 0, count), rest}
 
   defp apply_csi(surface, params, "m"), do: apply_sgr(surface, sgr_params(params))
   defp apply_csi(surface, params, "h"), do: apply_private_mode(surface, params, true)
@@ -431,7 +383,7 @@ defmodule Breeze.VTerm.Surface do
     values = csi_params(params)
     row = max(csi_param(values, 0, 1) - 1, 0)
     col = max(csi_param(values, 1, 1) - 1, 0)
-    put_cursor(surface, row, col)
+    put_cursor(surface, absolute_row(surface, row), col)
   end
 
   defp apply_csi(surface, params, "A") do
@@ -457,23 +409,25 @@ defmodule Breeze.VTerm.Surface do
 
   defp apply_csi(surface, params, "d") do
     row = max(csi_param(csi_params(params), 0, 1) - 1, 0)
-    put_cursor_row(surface, row)
+    put_cursor_row(surface, absolute_row(surface, row))
   end
 
   defp apply_csi(surface, params, "J") do
     case csi_param(csi_params(params), 0, 0) do
       1 -> clear_to_cursor(surface)
-      2 -> %{surface | screen: blank_screen(surface.cols, surface.rows)}
+      2 -> erase_rows(surface, 0, surface.rows - 1, 0, surface.cols - 1)
       3 -> %{surface | scrollback: :queue.new(), scrollback_count: 0}
-      _ -> clear_from_cursor(surface)
+      0 -> clear_from_cursor(surface)
+      _ -> surface
     end
   end
 
   defp apply_csi(surface, params, "K") do
     case csi_param(csi_params(params), 0, 0) do
       1 -> clear_line_to_cursor(surface)
-      2 -> put_row(surface, surface.cursor.row, blank_row(surface.cols))
-      _ -> clear_line_from_cursor(surface)
+      2 -> erase_rows(surface, surface.cursor.row, surface.cursor.row, 0, surface.cols - 1)
+      0 -> clear_line_from_cursor(surface)
+      _ -> surface
     end
   end
 
@@ -499,7 +453,7 @@ defmodule Breeze.VTerm.Surface do
       bottom = csi_param(values, 1, surface.rows) - 1
 
       if top < bottom and bottom < surface.rows do
-        surface |> Map.put(:scroll_region, {top, bottom}) |> put_cursor(0, 0)
+        surface |> Map.put(:scroll_region, {top, bottom}) |> home_cursor()
       else
         surface
       end
@@ -514,6 +468,40 @@ defmodule Breeze.VTerm.Surface do
   defp apply_csi(surface, params, "M"),
     do: edit_lines(surface, csi_param(csi_params(params), 0, 1), :up)
 
+  defp apply_csi(surface, params, "E"),
+    do:
+      surface
+      |> put_cursor_row(surface.cursor.row + csi_param(csi_params(params), 0, 1))
+      |> put_cursor_col(0)
+
+  defp apply_csi(surface, params, "F"),
+    do:
+      surface
+      |> put_cursor_row(surface.cursor.row - csi_param(csi_params(params), 0, 1))
+      |> put_cursor_col(0)
+
+  defp apply_csi(surface, params, "I"),
+    do: tab(surface, csi_param(csi_params(params), 0, 1), :forward)
+
+  defp apply_csi(surface, params, "Z"),
+    do: tab(surface, csi_param(csi_params(params), 0, 1), :backward)
+
+  defp apply_csi(surface, params, "g") do
+    case csi_param(csi_params(params), 0, 0) do
+      0 -> %{surface | tabstops: MapSet.delete(surface.tabstops, surface.cursor.col)}
+      n when n in [3, 5] -> %{surface | tabstops: MapSet.new()}
+      _ -> surface
+    end
+  end
+
+  defp apply_csi(surface, params, "X") do
+    last = min(surface.cols - 1, surface.cursor.col + csi_param(csi_params(params), 0, 1) - 1)
+    erase_rows(surface, surface.cursor.row, surface.cursor.row, surface.cursor.col, last)
+  end
+
+  defp apply_csi(surface, params, "`"), do: apply_csi(surface, params, "G")
+  defp apply_csi(surface, params, "a"), do: apply_csi(surface, params, "C")
+  defp apply_csi(surface, params, "e"), do: apply_csi(surface, params, "B")
   defp apply_csi(surface, _params, _final), do: surface
 
   defp sgr_params(""), do: [0]
@@ -521,10 +509,36 @@ defmodule Breeze.VTerm.Surface do
   defp sgr_params(params) do
     params
     |> String.split(";", trim: false)
-    |> Enum.map(fn
-      "" -> 0
-      value -> parse_int(value, 0)
+    |> Enum.flat_map(fn
+      "" ->
+        [0]
+
+      value ->
+        case String.split(value, ":") do
+          [single] ->
+            case parse_int(single, nil) do
+              nil -> []
+              n -> [n]
+            end
+
+          [color, "5", index] when color in ["38", "48"] ->
+            color_params([color, "5", index])
+
+          [color, "2", r, g, b] when color in ["38", "48"] ->
+            color_params([color, "2", r, g, b])
+
+          [color, "2", "", r, g, b] when color in ["38", "48"] ->
+            color_params([color, "2", r, g, b])
+
+          _ ->
+            []
+        end
     end)
+  end
+
+  defp color_params(values) do
+    values = Enum.map(values, &parse_int(&1, nil))
+    if Enum.any?(values, &is_nil/1), do: [], else: values
   end
 
   defp csi_params(""), do: []
@@ -552,6 +566,10 @@ defmodule Breeze.VTerm.Surface do
     |> Enum.reduce(surface, fn
       mode, acc when mode in [47, 1047, 1049] and enabled? -> enter_alt_screen(acc)
       mode, acc when mode in [47, 1047, 1049] -> leave_alt_screen(acc)
+      1, acc -> %{acc | application_cursor?: enabled?}
+      6, acc -> acc |> Map.put(:origin_mode?, enabled?) |> home_cursor()
+      7, acc -> %{acc | autowrap?: enabled?}
+      25, acc -> %{acc | cursor_visible?: enabled?}
       1048, acc when enabled? -> save_cursor(acc)
       1048, acc -> restore_cursor(acc)
       _mode, acc -> acc
@@ -559,7 +577,11 @@ defmodule Breeze.VTerm.Surface do
   end
 
   defp apply_private_mode(surface, params, enabled?) do
-    if 4 in csi_params(params), do: Map.put(surface, :insert_mode?, enabled?), else: surface
+    Enum.reduce(csi_params(params), surface, fn
+      4, acc -> %{acc | insert_mode?: enabled?}
+      20, acc -> %{acc | newline_mode?: enabled?}
+      _, acc -> acc
+    end)
   end
 
   defp parse_int(value, default) do
@@ -645,6 +667,7 @@ defmodule Breeze.VTerm.Surface do
         saved_scrollback_count: surface.scrollback_count,
         saved_style: surface.style,
         cursor: %{row: 0, col: 0},
+        wrap_pending?: false,
         screen: blank_screen(surface.cols, surface.rows),
         scrollback: :queue.new(),
         scrollback_count: 0
@@ -658,6 +681,7 @@ defmodule Breeze.VTerm.Surface do
       surface
       | alt_screen?: false,
         cursor: surface.saved_screen_cursor || %{row: 0, col: 0},
+        wrap_pending?: false,
         screen: surface.saved_screen || blank_screen(surface.cols, surface.rows),
         scrollback: surface.saved_scrollback || :queue.new(),
         scrollback_count: surface.saved_scrollback_count || 0,
@@ -670,66 +694,76 @@ defmodule Breeze.VTerm.Surface do
     }
   end
 
-  defp save_cursor(surface), do: %{surface | saved_cursor: surface.cursor}
+  defp save_cursor(surface),
+    do: %{
+      surface
+      | saved_cursor: surface.cursor,
+        saved_cursor_style: surface.style,
+        saved_cursor_visible?: surface.cursor_visible?
+    }
 
-  defp restore_cursor(%{saved_cursor: %{row: row, col: col}} = surface),
-    do: put_cursor(surface, row, col)
+  defp restore_cursor(%{saved_cursor: %{row: row, col: col}} = surface) do
+    surface = %{
+      surface
+      | style: surface.saved_cursor_style,
+        cursor_visible?: surface.saved_cursor_visible?
+    }
+
+    put_cursor(surface, row, col)
+  end
 
   defp restore_cursor(surface), do: surface
 
   defp put_grapheme(surface, grapheme) do
-    width = grapheme_width(grapheme)
-
-    surface =
-      if surface.cursor.col + width > surface.cols do
-        surface |> put_cursor_col(0) |> linefeed()
-      else
-        surface
-      end
-
-    surface = maybe_insert_cells(surface, width)
+    width = min(grapheme_width(grapheme), surface.cols)
+    surface = prepare_write(surface, width)
+    row = surface.cursor.row
+    col = surface.cursor.col
     cell = %{text: grapheme, style: surface.style}
 
-    surface =
-      surface
-      |> put_cell(surface.cursor.row, surface.cursor.col, cell)
-      |> fill_wide_continuation(width)
+    surface
+    |> maybe_insert_cells(width)
+    |> put_cell(row, col, cell)
+    |> fill_wide_continuation(width)
+    |> advance_after_write(col, width)
+  end
 
-    put_cursor_col(surface, surface.cursor.col + width)
+  defp prepare_write(surface, width) do
+    if surface.wrap_pending? or surface.cursor.col + width > surface.cols,
+      do: surface |> linefeed() |> put_cursor_col(0),
+      else: surface
+  end
+
+  defp advance_after_write(surface, col, width) do
+    if col + width >= surface.cols do
+      %{surface | cursor: %{surface.cursor | col: col}, wrap_pending?: surface.autowrap?}
+    else
+      %{surface | cursor: %{surface.cursor | col: col + width}, wrap_pending?: false}
+    end
   end
 
   defp put_ascii_run(surface, ""), do: surface
 
   defp put_ascii_run(surface, bytes) do
-    cond do
-      surface.cursor.col >= surface.cols ->
-        surface
-        |> put_cursor_col(0)
-        |> linefeed()
-        |> put_ascii_run(bytes)
+    surface = prepare_write(surface, 1)
+    col = surface.cursor.col
+    count = min(byte_size(bytes), surface.cols - col)
+    chunk = binary_part(bytes, 0, count)
+    rest = binary_part(bytes, count, byte_size(bytes) - count)
 
-      true ->
-        available = surface.cols - surface.cursor.col
-        take = min(byte_size(bytes), available)
-        chunk = binary_part(bytes, 0, take)
-        rest = binary_part(bytes, take, byte_size(bytes) - take)
-        cells = ascii_cells(chunk, surface.style)
+    surface =
+      surface
+      |> maybe_insert_cells(count)
+      |> put_cells(surface.cursor.row, col, ascii_cells(chunk, surface.style), count)
+      |> advance_after_write(col + count - 1, 1)
 
-        surface =
-          surface
-          |> maybe_insert_cells(take)
-          |> put_cells(surface.cursor.row, surface.cursor.col, cells, take)
-          |> put_cursor_col(surface.cursor.col + take)
+    # With DECAWM disabled, all excess characters replace the rightmost cell.
+    rest =
+      if not surface.autowrap? and byte_size(rest) > 1,
+        do: binary_part(rest, byte_size(rest) - 1, 1),
+        else: rest
 
-        if rest == "" do
-          surface
-        else
-          surface
-          |> put_cursor_col(0)
-          |> linefeed()
-          |> put_ascii_run(rest)
-        end
-    end
+    put_ascii_run(surface, rest)
   end
 
   defp maybe_insert_cells(surface, count) do
@@ -741,7 +775,7 @@ defmodule Breeze.VTerm.Surface do
     count = min(count, surface.cols - col)
     row = Enum.at(surface.screen, surface.cursor.row)
     {before, rest} = Enum.split(row, col)
-    blanks = List.duplicate(%{text: " ", style: surface.style}, count)
+    blanks = List.duplicate(erase_cell(surface), count)
 
     put_row(
       surface,
@@ -755,7 +789,7 @@ defmodule Breeze.VTerm.Surface do
     count = min(count, surface.cols - col)
     row = Enum.at(surface.screen, surface.cursor.row)
     {before, rest} = Enum.split(row, col)
-    blanks = List.duplicate(%{text: " ", style: surface.style}, count)
+    blanks = List.duplicate(erase_cell(surface), count)
 
     put_row(
       surface,
@@ -848,7 +882,7 @@ defmodule Breeze.VTerm.Surface do
     row = surface.cursor.row
 
     if row >= top and row <= bottom do
-      surface |> shift_rows(row, bottom, count, direction, false) |> put_cursor_col(0)
+      shift_rows(surface, row, bottom, count, direction, false)
     else
       surface
     end
@@ -861,7 +895,7 @@ defmodule Breeze.VTerm.Surface do
     {region, after_region} = Enum.split(rest, height)
 
     blanks =
-      repeat(count, fn -> List.duplicate(%{text: " ", style: surface.style}, surface.cols) end)
+      repeat(count, fn -> List.duplicate(erase_cell(surface), surface.cols) end)
 
     {shifted, dropped} =
       case direction do
@@ -879,65 +913,55 @@ defmodule Breeze.VTerm.Surface do
 
   defp clear_from_cursor(surface) do
     Enum.reduce(surface.cursor.row..(surface.rows - 1), surface, fn row, acc ->
-      first_col = if row == surface.cursor.row, do: surface.cursor.col, else: 0
-      cells = Enum.at(acc.screen, row)
-
-      cleared =
-        cells
-        |> Enum.with_index()
-        |> Enum.map(fn
-          {_cell, col} when col >= first_col -> blank_cell()
-          {cell, _col} -> cell
-        end)
-
-      put_row(acc, row, cleared)
+      first = if row == surface.cursor.row, do: surface.cursor.col, else: 0
+      erase_rows(acc, row, row, first, surface.cols - 1)
     end)
   end
 
   defp clear_to_cursor(surface) do
     Enum.reduce(0..surface.cursor.row, surface, fn row, acc ->
-      last_col = if row == surface.cursor.row, do: surface.cursor.col, else: surface.cols - 1
-      cells = Enum.at(acc.screen, row)
-
-      cleared =
-        cells
-        |> Enum.with_index()
-        |> Enum.map(fn
-          {_cell, col} when col <= last_col -> blank_cell()
-          {cell, _col} -> cell
-        end)
-
-      put_row(acc, row, cleared)
+      last = if row == surface.cursor.row, do: surface.cursor.col, else: surface.cols - 1
+      erase_rows(acc, row, row, 0, last)
     end)
   end
 
-  defp clear_line_from_cursor(surface) do
-    cells = Enum.at(surface.screen, surface.cursor.row)
+  defp clear_line_from_cursor(surface),
+    do:
+      erase_rows(
+        surface,
+        surface.cursor.row,
+        surface.cursor.row,
+        surface.cursor.col,
+        surface.cols - 1
+      )
 
-    cleared =
-      cells
-      |> Enum.with_index()
-      |> Enum.map(fn
-        {_cell, col} when col >= surface.cursor.col -> blank_cell()
-        {cell, _col} -> cell
+  defp clear_line_to_cursor(surface),
+    do: erase_rows(surface, surface.cursor.row, surface.cursor.row, 0, surface.cursor.col)
+
+  defp erase_rows(surface, top, bottom, left, right) do
+    blank = erase_cell(surface)
+
+    if left == 0 and right == surface.cols - 1 do
+      # Fully erased rows can share one immutable row without inspecting cells.
+      cells = List.duplicate(blank, surface.cols)
+      Enum.reduce(top..bottom, surface, &put_row(&2, &1, cells))
+    else
+      Enum.reduce(top..bottom, surface, fn row, acc ->
+        update_row(acc, row, fn cells ->
+          cells
+          |> Enum.with_index()
+          |> Enum.map(fn {cell, col} ->
+            if col >= left and col <= right, do: blank, else: cell
+          end)
+          |> normalize_edited_row()
+        end)
       end)
-
-    put_row(surface, surface.cursor.row, cleared)
+    end
   end
 
-  defp clear_line_to_cursor(surface) do
-    cells = Enum.at(surface.screen, surface.cursor.row)
-
-    cleared =
-      cells
-      |> Enum.with_index()
-      |> Enum.map(fn
-        {_cell, col} when col <= surface.cursor.col -> blank_cell()
-        {cell, _col} -> cell
-      end)
-
-    put_row(surface, surface.cursor.row, cleared)
-  end
+  # libvterm's screen erase retains colors, but resets character attributes.
+  defp erase_cell(surface),
+    do: %{text: " ", style: Map.take(surface.style, [:foreground_color, :background_color])}
 
   defp row_segments(row) do
     row
@@ -1005,12 +1029,47 @@ defmodule Breeze.VTerm.Surface do
   end
 
   defp put_cursor_row(surface, row) do
-    %{surface | cursor: %{surface.cursor | row: clamp(row, 0, surface.rows - 1)}}
+    {top, bottom} =
+      if surface.origin_mode?, do: scroll_region(surface), else: {0, surface.rows - 1}
+
+    %{surface | cursor: %{surface.cursor | row: clamp(row, top, bottom)}, wrap_pending?: false}
   end
 
   defp put_cursor_col(surface, col) do
-    %{surface | cursor: %{surface.cursor | col: clamp(col, 0, surface.cols)}}
+    %{
+      surface
+      | cursor: %{surface.cursor | col: clamp(col, 0, surface.cols - 1)},
+        wrap_pending?: false
+    }
   end
+
+  defp default_tabstops(cols), do: MapSet.new(for col <- 0..(cols - 1), rem(col, 8) == 0, do: col)
+
+  defp resize_tabstops(surface, cols) do
+    kept = MapSet.filter(surface.tabstops, &(&1 < cols))
+    added = MapSet.filter(default_tabstops(cols), &(&1 >= surface.cols))
+    MapSet.union(kept, added)
+  end
+
+  defp tab(surface, count, direction) do
+    col = surface.cursor.col
+    stops = surface.tabstops |> Enum.sort()
+
+    {stops, fallback} =
+      case direction do
+        :forward -> {Enum.filter(stops, &(&1 > col)), surface.cols - 1}
+        :backward -> {stops |> Enum.filter(&(&1 < col)) |> Enum.reverse(), 0}
+      end
+
+    target = Enum.at(stops, min(count, surface.cols) - 1, fallback)
+    if target == col, do: surface, else: put_cursor_col(surface, target)
+  end
+
+  defp absolute_row(%{origin_mode?: true} = surface, row),
+    do: elem(scroll_region(surface), 0) + row
+
+  defp absolute_row(_surface, row), do: row
+  defp home_cursor(surface), do: put_cursor(surface, absolute_row(surface, 0), 0)
 
   defp next_grapheme(<<_codepoint::utf8, _rest::binary>> = bytes) do
     {grapheme, rest} = String.next_grapheme(bytes)
