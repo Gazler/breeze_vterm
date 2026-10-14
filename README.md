@@ -31,8 +31,31 @@ Text selection is opt-in:
 ```
 
 Enable Breeze mouse reporting with `mouse: [mode: :drag]`. Left-drag selects text.
-Each drag movement at or beyond the top or bottom edge scrolls one row in that
-direction and extends the selection. Right-clicking a selection emits
+Each mouse movement at the top or bottom edge scrolls one row. To continue
+scrolling while the pointer is held at an edge, opt in on the component:
+
+```heex
+<.terminal id="console" surface={@surface} selectable selection_autoscroll br-change="console_input" />
+```
+
+Forward its timer messages through the owning view's existing callback:
+
+```elixir
+def handle_info({Breeze.VTerm, :edge_scroll, _, _} = message, term),
+  do: Breeze.VTerm.handle_info(message, term)
+```
+
+This uses ordinary process timers and `Breeze.View.update_implicit/3`; it needs
+no additional Breeze timer API or implicit message callback. The example includes
+both the opt-in and message forwarding. Each tick advances after 50 ms, starting
+at one row and increasing to two after 400 ms and three after 800 ms
+(20–60 rows/second, subject to render time). Moving inside, releasing, cancelling,
+losing focus, changing viewport geometry, or reaching the buffer boundary stops
+the timer. Removed terminals and stale messages do not request a render.
+Breeze's focus fix invokes the existing `blur/1` handler when an asynchronous
+view message changes focus. Without it, that path releases mouse capture but
+leaves the timer active.
+Right-clicking a selection emits
 `%{copy: text}` through `br-change` for the host to write to the clipboard.
 Selection also emits `%{selection: :start}` and `%{selection: :clear}` so the host
 can route keys through Breeze while selecting.
