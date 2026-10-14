@@ -4,7 +4,10 @@ defmodule Breeze.VTerm.Components do
 
   Selection is disabled by default. Set `selectable={true}` to enable left-drag
   text selection within the pane. Dragging at or beyond the top or bottom edge
-  scrolls through the buffer, extending the selection. Right-clicking a selection emits
+  scrolls through the buffer, extending the selection. Enable
+  `selection_autoscroll={true}` and forward timer messages to
+  `Breeze.VTerm.handle_info/2` to keep scrolling while held at an edge.
+  Right-clicking a selection emits
   `%{copy: text}` through `br-change`; the host writes it to the client clipboard.
   `%{selection: :start}` and `%{selection: :clear}` let hosts route keys through
   Breeze while a selection is active. Typing or Escape clears the selection.
@@ -26,6 +29,10 @@ defmodule Breeze.VTerm.Components do
   attr :copy_notice, :integer,
     default: nil,
     doc: "Character count shown in a bottom-right copy toast; clear to dismiss"
+
+  attr :selection_autoscroll, :boolean,
+    default: false,
+    doc: "Continue scrolling at an edge; forward timer messages to Breeze.VTerm.handle_info/2"
 
   attr :"cursor-blink", :boolean,
     default: true,
@@ -75,6 +82,7 @@ defmodule Breeze.VTerm.Components do
       style={Breeze.Blocks.inline_style(assigns)}
       cursor-blink={boolean_attr(Map.get(assigns, :"cursor-blink", true))}
       terminal-selectable={boolean_attr(assigns[:selectable] in [true, "true"])}
+      terminal-selection-autoscroll={boolean_attr(@selection_autoscroll)}
       terminal-copy-notice={assigns[:copy_notice]}
       terminal-surface={@surface}
       terminal-cols={@surface.cols}

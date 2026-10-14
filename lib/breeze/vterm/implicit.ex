@@ -7,6 +7,8 @@ defmodule Breeze.VTerm.Implicit do
   alias Breeze.VTerm.Surface
   alias Breeze.VTerm.Selection
 
+  @edge_scroll_interval 50
+
   def init(_children, root_attrs, last_state) do
     surface = Map.get(root_attrs, :"terminal-surface")
     selectable? = truthy_attr?(Map.get(root_attrs, :"terminal-selectable", false))
@@ -19,6 +21,12 @@ defmodule Breeze.VTerm.Implicit do
 
     state =
       last_state
+      |> Map.put(:id, Map.get(root_attrs, :id))
+      |> Map.put(
+        :selection_autoscroll?,
+        Map.get(root_attrs, :"terminal-selection-autoscroll", false) not in [false, "false"]
+      )
+      |> Map.put(:edge_scroll, if(selection, do: Map.get(last_state, :edge_scroll), else: nil))
       |> Map.put(:copy_notice, Map.get(root_attrs, :"terminal-copy-notice"))
       |> Map.put(:surface, surface)
       |> Map.put(:selectable?, selectable?)
@@ -60,7 +68,43 @@ defmodule Breeze.VTerm.Implicit do
     {:ok, state, meta}
   end
 
-  def clear_selection(state), do: Map.put(state, :selection, nil)
+  def clear_selection(state), do: state |> stop_edge_scroll() |> Map.put(:selection, nil)
+
+  def blur(state) do
+    state = stop_edge_scroll(state)
+    if state.selection, do: put_in(state.selection.dragging?, false), else: state
+  end
+
+  # Called by the owning view through Breeze.VTerm.handle_info/2. Blur,
+  # release and selection invalidation cancel the timer in this same state.
+  def scroll_tick(token, %{edge_scroll: %{token: token} = edge} = state) do
+    viewport = Viewport.from_dimensions(state[:__element__])
+
+    if state.selection_autoscroll? and match?(%{dragging?: true}, state.selection) and
+         edge.geometry == {viewport.viewport_width, viewport.viewport_height} do
+      old_offset = effective_offset_y(state, viewport)
+      elapsed = max(System.monotonic_time(:millisecond) - edge.started_at, 0)
+      step = min(1 + div(elapsed, 400), 3)
+      state = put_offset(state, old_offset + edge.direction * step, viewport)
+
+      point =
+        selection_point(state, %{"element" => viewport, "row" => edge.row, "col" => edge.col})
+
+      state = put_in(state.selection.head, point)
+      state = put_in(state.selection.moved?, true)
+
+      if effective_offset_y(state, viewport) != old_offset and
+           scrollable?(state, viewport, edge.direction) do
+        schedule_edge_scroll(state)
+      else
+        stop_edge_scroll(state)
+      end
+    else
+      stop_edge_scroll(state)
+    end
+  end
+
+  def scroll_tick(_token, state), do: state
 
   # Keep the editable surface in the view process; the compositor only needs
   # visible selection runs and cursor flags.
@@ -90,6 +134,7 @@ defmodule Breeze.VTerm.Implicit do
         %{selectable?: true, surface: %Surface{}} = state
       ) do
     point = selection_point(state, event)
+    state = stop_edge_scroll(state)
 
     {{:change, %{selection: :start}},
      Map.put(state, :selection, %{
@@ -107,7 +152,9 @@ defmodule Breeze.VTerm.Implicit do
         %{selection: %{dragging?: true} = selection} = state
       )
       when action in ["move", "release"] do
-    state = scroll_selection(state, event)
+    state =
+      if action == "release", do: stop_edge_scroll(state), else: scroll_selection(state, event)
+
     point = selection_point(state, event)
 
     selection = %{
@@ -124,7 +171,7 @@ defmodule Breeze.VTerm.Implicit do
     else
       if action == "release",
         do: {{:change, %{selection: :clear}}, clear_selection(state), capture_mouse: false},
-        else: {:noreply, state}
+        else: {:noreply, state, consumed: true}
     end
   end
 
@@ -134,11 +181,11 @@ defmodule Breeze.VTerm.Implicit do
   end
 
   def handle_event(_, %{"key" => "PageUp", "element" => element}, state) do
-    {:noreply, scroll_page(state, element, -1)}
+    {:noreply, scroll_page(stop_edge_scroll(state), element, -1)}
   end
 
   def handle_event(_, %{"key" => "PageDown", "element" => element}, state) do
-    {:noreply, scroll_page(state, element, 1)}
+    {:noreply, scroll_page(stop_edge_scroll(state), element, 1)}
   end
 
   def handle_event(
@@ -151,7 +198,7 @@ defmodule Breeze.VTerm.Implicit do
     offset_y =
       effective_offset_y(state, viewport) + wheel_step(viewport) * Common.wheel_repeat(mouse)
 
-    {:noreply, put_offset(state, offset_y, viewport)}
+    {:noreply, put_offset(stop_edge_scroll(state), offset_y, viewport)}
   end
 
   def handle_event(
@@ -164,7 +211,7 @@ defmodule Breeze.VTerm.Implicit do
     offset_y =
       effective_offset_y(state, viewport) - wheel_step(viewport) * Common.wheel_repeat(mouse)
 
-    {:noreply, put_offset(state, offset_y, viewport)}
+    {:noreply, put_offset(stop_edge_scroll(state), offset_y, viewport)}
   end
 
   def handle_event(_, event, state) do
@@ -407,15 +454,77 @@ defmodule Breeze.VTerm.Implicit do
     viewport = Viewport.from_dimensions(event["element"])
     height = min(viewport.viewport_height, state.surface.rows)
 
+    direction =
+      cond do
+        height <= 0 -> 0
+        row <= 0 -> -1
+        row >= height - 1 -> 1
+        true -> 0
+      end
+
+    automatic? =
+      Map.get(state, :selection_autoscroll?, false) and is_binary(state[:id])
+
     cond do
-      height <= 0 -> state
-      row <= 0 -> put_offset(state, effective_offset_y(state, viewport) - 1, viewport)
-      row >= height - 1 -> put_offset(state, effective_offset_y(state, viewport) + 1, viewport)
-      true -> state
+      direction == 0 ->
+        stop_edge_scroll(state)
+
+      not automatic? ->
+        put_offset(
+          stop_edge_scroll(state),
+          effective_offset_y(state, viewport) + direction,
+          viewport
+        )
+
+      match?(%{direction: ^direction}, state.edge_scroll) ->
+        %{state | edge_scroll: %{state.edge_scroll | row: row, col: event["col"] || 0}}
+
+      true ->
+        state =
+          state
+          |> stop_edge_scroll()
+          |> put_offset(effective_offset_y(state, viewport) + direction, viewport)
+
+        if scrollable?(state, viewport, direction) do
+          edge = %{
+            token: make_ref(),
+            timer: nil,
+            direction: direction,
+            row: row,
+            col: event["col"] || 0,
+            geometry: {viewport.viewport_width, viewport.viewport_height},
+            started_at: System.monotonic_time(:millisecond)
+          }
+
+          schedule_edge_scroll(%{state | edge_scroll: edge})
+        else
+          state
+        end
     end
   end
 
   defp scroll_selection(state, _event), do: state
+
+  defp scrollable?(state, viewport, -1), do: effective_offset_y(state, viewport) > 0
+
+  defp scrollable?(state, viewport, 1),
+    do: effective_offset_y(state, viewport) < Viewport.max_scroll_y(viewport)
+
+  defp schedule_edge_scroll(state) do
+    timer =
+      Process.send_after(
+        self(),
+        {Breeze.VTerm, :edge_scroll, state.id, state.edge_scroll.token},
+        @edge_scroll_interval
+      )
+
+    put_in(state.edge_scroll.timer, timer)
+  end
+
+  defp stop_edge_scroll(state) do
+    if timer = get_in(state, [:edge_scroll, :timer]), do: Process.cancel_timer(timer)
+    Map.put(state, :edge_scroll, nil)
+  end
 
   defp selection_point(state, event) do
     viewport = Viewport.from_dimensions(event["element"])

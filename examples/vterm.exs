@@ -115,6 +115,7 @@ defmodule VTermExample do
             id="vterm"
             surface={@current_console.surface}
             selectable
+            selection_autoscroll
             br-change="vterm_input"
             class="border focus:border-primary"
             capture_control_keys={@capture_shell_input}
@@ -165,6 +166,9 @@ defmodule VTermExample do
     do: {:noreply, assign(term, show_debug: !term.assigns.show_debug)}
 
   def handle_event(_, _, term), do: {:noreply, term}
+
+  def handle_info({Breeze.VTerm, :edge_scroll, _, _} = message, term),
+    do: Breeze.VTerm.handle_info(message, term)
 
   def handle_info({:vterm_output, console_id, bytes}, term) do
     {:noreply, buffer_shell_output(term, console_id, bytes), invalidate: false}

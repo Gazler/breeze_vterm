@@ -22,6 +22,7 @@ defmodule Breeze.VTerm.ComponentsTest do
     assert {:ok, _, _, [decoration]} = ChildServer.render_snapshot(pid, focused: "terminal")
     assert decoration.every_ms == :change
     assert decoration.state.cursor_blink? == false
+    assert decoration.state.selection_autoscroll? == false
   end
 
   defmodule PromptTerminalExample do

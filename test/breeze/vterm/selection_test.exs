@@ -242,6 +242,7 @@ defmodule Breeze.VTerm.SelectionTest do
        assign(term,
          owner: opts[:owner],
          selectable: Keyword.get(opts, :selectable, false),
+         selection_autoscroll: Keyword.get(opts, :selection_autoscroll, false),
          surface:
            Keyword.get(opts, :surface) ||
              Surface.new(cols: 8, rows: 2) |> Surface.write("hello\r\nworld")
@@ -256,6 +257,7 @@ defmodule Breeze.VTerm.SelectionTest do
           id="terminal"
           surface={@surface}
           selectable={@selectable}
+          selection_autoscroll={@selection_autoscroll}
           cursor-blink={false}
           br-change="terminal"
         />
@@ -471,7 +473,7 @@ defmodule Breeze.VTerm.SelectionTest do
 
     state =
       Enum.reduce([1, 0, 0], state, fn offset, state ->
-        {:noreply, state} = Breeze.VTerm.Implicit.handle_event(nil, drag, state)
+        {:noreply, state, consumed: true} = Breeze.VTerm.Implicit.handle_event(nil, drag, state)
         assert state.offset_y == offset
         assert state.selection.head == {offset, 0}
         assert state.selection.anchor == {3, 3}
@@ -552,7 +554,7 @@ defmodule Breeze.VTerm.SelectionTest do
 
     state =
       Enum.reduce([1, 2, 2], state, fn offset, state ->
-        {:noreply, state} = Breeze.VTerm.Implicit.handle_event(nil, drag, state)
+        {:noreply, state, consumed: true} = Breeze.VTerm.Implicit.handle_event(nil, drag, state)
         assert state.offset_y == offset
         assert state.pinned_bottom == (offset == 2)
         assert state.selection.head == {offset + 1, 3}
