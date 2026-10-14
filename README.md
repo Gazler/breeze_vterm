@@ -83,8 +83,7 @@ Home, and End honor application cursor mode. The component does this automatical
 This is a selected subset, not full libvterm/xterm compatibility. Legacy
 character sets, mouse reporting to child applications, graphics,
 and complete Unicode grapheme handling are outside this port. Unsupported
-commands are ignored. Existing alternate-screen and resize policies are retained;
-the comparison below does not establish parity for those operations.
+commands are ignored. Existing alternate-screen and resize policies are retained.
 
 ### Terminal query replies
 
@@ -181,78 +180,9 @@ Consumers should process output promptly and bound any buffering they introduce.
 application's OS permissions and inherited environment. Applications must control
 who can send shell input and apply any required OS isolation separately.
 
-## Development
+## Experimental cell-diff frame renderer
 
-```sh
-mix test
-mix run bench/surface_benchmark.exs
-ITERATIONS=30 PREFILL_LINES=2000 mix run bench/vterm_benchmark.exs
-```
-
-The surface benchmark reports median time and reductions over five samples for
-prompt editing, styled output, and bulk output. The full benchmark also measures
-Breeze layout and rendering, using the demo without starting shell processes.
-
-### Comparing with libvterm
-
-The optional reference harness compiles libvterm 0.3.3 as a separate executable.
-It compares text, supported styles, and cursor position for the shared fixtures,
-feeding both complete streams and individual bytes. Regular `mix test` exercises
-the port without requiring C, and checks every two-part split of those fixtures.
-
-Download and unpack the [0.3.3 source release](https://www.leonerd.org.uk/code/libvterm/libvterm-0.3.3.tar.gz),
-then run with a C compiler available:
-
-```sh
-LIBVTERM_SRC=/path/to/libvterm-0.3.3 mix run bench/libvterm_benchmark.exs
-LIBVTERM_SRC=/path/to/libvterm-0.3.3 CHECK_ONLY=1 mix run bench/libvterm_benchmark.exs
-BASELINE_REF=5bac356 LIBVTERM_SRC=/path/to/libvterm-0.3.3 SAMPLES=7 mix run bench/libvterm_benchmark.exs
-```
-
-The timing comparison uses identical streams and dimensions with scrollback
-disabled on both sides. It reports median time per write over five samples, and
-checks the final screens of the repeated workloads outside the timed region.
-Compilation, process startup, construction, file I/O, and snapshot extraction are
-excluded. This measures parsing and screen updates; Breeze rendering, selection,
-PTY transport, and any prospective NIF/Port integration overhead are excluded.
-The two implementations retain their own screen representations, so results are
-workload-dependent and are not a general comparison of language speed.
-
-Defaults are `SIZES=120x40,400x120`, `ITERATIONS=10000` for short writes,
-100 iterations for full-screen repainting, 10 for bulk output, and `SAMPLES=5`.
-Override `CC` to select the compiler. C is built with `-O2`.
-
-Intentional differences from the reference include bounded parsing, discarding
-malformed UTF-8 instead of emitting replacement characters, and correctly handling
-the omitted color-space field in `38:2::r:g:b` (misread by libvterm 0.3.3).
-
-Before/after measurements on an Intel Core Ultra X7 358H, Elixir 1.20.4 / OTP 29,
-GCC 16.2.1 `-O2` (2026-10-13, seven samples; microseconds per write).
-These recorded measurements used the original pre-port selection sources from
-`f9acdcd008588c73a2af99d450b27f38f635452d`. The benchmark now defaults to the
-rebased selection commit `5bac356f3f4097117049e175f09fc131bf13121c`, which also
-includes terminal query replies. Its Surface is compiled into a separate namespace
-using the same current dependencies. Before/after timing order alternates by
-sample; both versions must produce the same final cells for each workload.
-
-| Size | Workload | Bytes/write | Before | After | libvterm C |
-| --- | --- | ---: | ---: | ---: | ---: |
-| 120×40 | Prompt editing | 4 | 0.629 | 0.909 | 0.056 |
-| 120×40 | Styled scrolling line | 22 | 2.663 | 3.432 | 2.393 |
-| 120×40 | Full-screen repaint | 4,803 | 195.17 | 179.91 | 62.87 |
-| 120×40 | Bulk scrolling | 120,000 | 7,400.70 | 6,713.00 | 3,408.93 |
-| 400×120 | Prompt editing | 4 | 2.471 | 2.966 | 0.053 |
-| 400×120 | Styled scrolling line | 22 | 20.780 | 22.492 | 24.376 |
-| 400×120 | Full-screen repaint | 48,003 | 2,773.76 | 2,166.83 | 434.31 |
-| 400×120 | Bulk scrolling | 400,000 | 34,676.70 | 23,536.80 | 27,603.29 |
-
-These are local observations, not performance guarantees. The shared conformance
-suite currently checks 34 streams in both chunkings; it is not a full libvterm
-conformance suite.
-
-### Experimental cell-diff frame renderer
-
-`Breeze.VTerm.Frame` now composes base text, selection and cursor overlays before
+`Breeze.VTerm.Frame` composes base text, selection and cursor overlays before
 comparing cells. It sends changed spans, keeps wide glyph boundaries intact, and
 preserves the original writer's final cursor and delayed-wrap state. Supported
 SGR sequences are retained verbatim, including attributes outside Surface's
@@ -268,14 +198,18 @@ wins. Output styling is not retained between frames. This remains an opt-in
 experiment for applications, with a server CPU/bandwidth tradeoff. The included
 example enables it by default.
 
+Like Breeze's existing frame writer, the renderer assumes ownership of the
+complete terminal with normal origin mode and full-screen scrolling margins
+between frames.
+
 Every nonempty frame, including initial paints and fallback redraws, is enclosed
 in synchronized-output markers (`CSI ? 2026 h` / `CSI ? 2026 l`). This lets
 supporting terminals such as Ghostty display the scroll and its repairs together
 instead of painting an intermediate state. Both markers travel with the completed
 frame in the same adapter write; idle frames still send nothing. See
 [Ghostty's synchronized-output guidance](https://ghostty.org/docs/help/synchronized-output).
-This adds 16 ANSI bytes per frame before SSH overhead. The historical payload
-tables below predate these markers; copied clipboard text is unchanged.
+This adds 16 ANSI bytes per frame before SSH overhead; copied clipboard text
+is unchanged.
 
 The integration belongs before the terminal adapter writes to SSH. Breeze's
 per-session `:frame_renderer` option handles complete frames and live child
@@ -302,4 +236,10 @@ Breeze.Server.start_link(
   terminal: ssh_terminal,
   frame_renderer: Breeze.VTerm.Frame
 )
+```
+
+## Development
+
+```sh
+mix test
 ```
