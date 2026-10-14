@@ -502,6 +502,7 @@ unless System.get_env("BREEZE_VTERM_SKIP_RUN") in ["1", "true", "TRUE"] do
   Breeze.Example.run(
     [
       view: VTermExample,
+      frame_renderer: Breeze.VTerm.Frame,
       alt_screen: true,
       hide_cursor: true,
       mouse: [mode: :drag],
