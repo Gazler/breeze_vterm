@@ -4,12 +4,16 @@ defmodule Breeze.VTerm.FrameTest do
   alias Breeze.Server.Frame, as: Legacy
   alias Breeze.VTerm.{Frame, Surface}
 
+  @sync_begin "\e[?2026h"
+  @sync_end "\e[?2026l"
+  @sync_overhead byte_size(@sync_begin) + byte_size(@sync_end)
+
   test "a selection extension only repaints its changed cell" do
     line = String.duplicate("a", 400)
     before = [highlight(0, 0, String.duplicate("a", 200))]
     after_overlays = [highlight(0, 0, String.duplicate("a", 201))]
     {original, result} = check([line], [line], before, after_overlays, 400)
-    assert byte_size(result) < 40
+    assert byte_size(result) < 40 + @sync_overhead
     assert byte_size(result) < byte_size(original) / 10
     assert result =~ "\e[1;201H"
     refute result =~ "aa"
@@ -80,7 +84,7 @@ defmodule Breeze.VTerm.FrameTest do
         ] do
       original = Legacy.build_payload(["old"], [line], [], overlays, 20)
 
-      assert Frame.build_payload(["old"], [line], [], overlays, 20) ==
+      assert Frame.build_payload(["old"], [line], [], overlays, 20) |> synchronized_body() ==
                original
     end
   end
@@ -95,7 +99,7 @@ defmodule Breeze.VTerm.FrameTest do
   end
 
   test "initial paint, idle frames and geometry changes use existing semantics" do
-    assert Frame.build_payload(nil, ["abc"], [], [], 10) ==
+    assert Frame.build_payload(nil, ["abc"], [], [], 10) |> synchronized_body() ==
              Legacy.build_payload(nil, ["abc"], [], [], 10)
 
     assert Frame.build_payload(["abc"], ["abc"], [], [], 10) == ""
@@ -103,7 +107,7 @@ defmodule Breeze.VTerm.FrameTest do
     hidden = [%{x: 0, y: 0, content: "hidden", visible?: false}]
     assert Frame.build_payload(["abc"], ["abc"], [], hidden, 10) == ""
 
-    assert Frame.build_payload(["abc"], ["abc", "def"], [], [], 10) ==
+    assert Frame.build_payload(["abc"], ["abc", "def"], [], [], 10) |> synchronized_body() ==
              Legacy.build_payload(["abc"], ["abc", "def"], [], [], 10)
   end
 
@@ -206,7 +210,7 @@ defmodule Breeze.VTerm.FrameTest do
     old = ["\e]8;;https://example.com\e\\link\e]8;;\e\\", "aaaa", "bbbb", "cccc", "dddd"]
     new = [hd(old), "bbbb", "cccc", "dddd", "eeee"]
 
-    assert Frame.build_payload(old, new, [], [], 8) ==
+    assert Frame.build_payload(old, new, [], [], 8) |> synchronized_body() ==
              Legacy.build_payload(old, new, [], [], 8)
 
     {_, candidate} = check(["a", "b", "c"], ["b", "c", "d"], [], [], 1)
@@ -234,7 +238,42 @@ defmodule Breeze.VTerm.FrameTest do
     end)
   end
 
+  test "synchronized scroll frames preserve the screen when delivered one byte at a time" do
+    source = for row <- 0..10, do: String.duplicate(<<65 + row>>, 80)
+    old = Enum.take(source, 10)
+    new = Enum.drop(source, 1)
+    overlays = [highlight(12, 4, "stationary")]
+    payload = Frame.build_payload(old, new, overlays, overlays, 80)
+    assert synchronized_body(payload) =~ "\eD"
+
+    initial =
+      Surface.new(cols: 80, rows: 10, scrollback_limit: 0)
+      |> Surface.write(Legacy.build_payload(nil, old, [], overlays, 80))
+
+    actual =
+      for <<byte <- payload>>, reduce: initial, do: (display -> Surface.write(display, <<byte>>))
+
+    expected = Surface.write(initial, Legacy.build_payload(old, new, overlays, overlays, 80))
+
+    assert actual.screen == expected.screen
+    assert actual.cursor == expected.cursor
+    assert actual.wrap_pending? == expected.wrap_pending?
+    assert actual.style == expected.style
+    assert actual.scroll_region == {0, 9}
+  end
+
   defp highlight(x, y, text), do: %{x: x, y: y, content: "\e[0m\e[7m" <> text <> "\e[0m"}
+
+  defp synchronized_body(""), do: ""
+
+  defp synchronized_body(payload) do
+    assert String.starts_with?(payload, @sync_begin)
+    assert String.ends_with?(payload, @sync_end)
+    body = binary_part(payload, byte_size(@sync_begin), byte_size(payload) - @sync_overhead)
+    refute body =~ @sync_begin
+    refute body =~ @sync_end
+    body
+  end
 
   defp check(previous, lines, old, new, width) do
     original = Legacy.build_payload(previous, lines, old, new, width)
@@ -251,7 +290,7 @@ defmodule Breeze.VTerm.FrameTest do
     assert actual.wrap_pending? == expected.wrap_pending?
     assert actual.style == expected.style
     assert actual.scroll_region in [nil, {0, length(lines) - 1}]
-    assert byte_size(candidate) <= byte_size(original)
+    assert byte_size(synchronized_body(candidate)) <= byte_size(original)
     {original, candidate}
   end
 end
