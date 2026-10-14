@@ -62,6 +62,18 @@ defmodule Breeze.VTerm.Implicit do
 
   def clear_selection(state), do: Map.put(state, :selection, nil)
 
+  # Keep the editable surface in the view process; the compositor only needs
+  # visible selection runs and cursor flags.
+  def animation_state(%{surface: %Surface{} = surface} = state, layout) do
+    viewport = Viewport.from_dimensions(layout)
+
+    state
+    |> Map.put(:selection_highlights, selection_highlights(state, viewport))
+    |> Map.put(:surface, %{cols: surface.cols, cursor_visible?: surface.cursor_visible?})
+  end
+
+  def animation_state(state, _layout), do: state
+
   def handle_event(
         _,
         %{"mouse" => %{"button" => "right", "action" => "press"}},
@@ -243,7 +255,7 @@ defmodule Breeze.VTerm.Implicit do
 
   defp selection_overlays(
          box,
-         %{selection: %{moved?: true} = selection, surface: surface} = state,
+         %{selection: %{moved?: true}} = state,
          ctx
        ) do
     viewport = Viewport.from_dimensions(ctx[:layout])
@@ -251,19 +263,24 @@ defmodule Breeze.VTerm.Implicit do
     theme = Map.get(ctx, :theme)
     defaults = Theme.default_style(theme)
 
-    Selection.highlights(
-      surface,
-      selection.anchor,
-      selection.head,
-      offset,
-      viewport.viewport_height,
-      min(selection.width, viewport.viewport_width || surface.cols)
-    )
-    |> Enum.map(fn {row, col, text, style} ->
+    {runs, _codes} =
+      Map.get_lazy(state, :selection_highlights, fn -> selection_highlights(state, viewport) end)
+      |> Enum.map_reduce(%{}, fn {row, col, text, style}, codes ->
+        open = Map.get_lazy(codes, style, fn -> inverse_open(Map.merge(defaults, style)) end)
+        run = {row, col, open <> text <> Termite.Style.reset_code(), text}
+        {run, Map.put(codes, style, open)}
+      end)
+
+    runs
+    |> Enum.chunk_while([], &collect_selection_run/2, fn runs ->
+      {:cont, Enum.reverse(runs), []}
+    end)
+    |> Enum.flat_map(&coalesce_selection_row/1)
+    |> Enum.map(fn {row, col, content} ->
       %{
         x: viewport.left + content_left_offset(box) + col,
         y: viewport.top + content_top_offset(box) + row - offset,
-        content: inverse_text(text, Map.merge(defaults, style)),
+        content: content,
         visible?: true
       }
     end)
@@ -271,7 +288,69 @@ defmodule Breeze.VTerm.Implicit do
 
   defp selection_overlays(_, _, _), do: []
 
-  defp inverse_text(text, style) do
+  defp selection_highlights(
+         %{selection: %{moved?: true} = selection, surface: surface} = state,
+         viewport
+       ) do
+    Selection.highlights(
+      surface,
+      selection.anchor,
+      selection.head,
+      effective_offset_y(state, viewport),
+      viewport.viewport_height,
+      min(selection.width, viewport.viewport_width || surface.cols)
+    )
+  end
+
+  defp selection_highlights(_, _), do: []
+
+  # One overlay per style run can exhaust the renderer's bounded cache. Join
+  # adjacent runs, retaining the last run's origin: TerminalOverlay restores the
+  # cursor there after painting, and the frame writer preserves that position.
+  defp collect_selection_run({row, col, _, _} = run, [{row, previous, _, text} | _] = runs) do
+    case selection_run_width(text, 0) do
+      width when is_integer(width) and previous + width == col -> {:cont, [run | runs]}
+      _ -> {:cont, Enum.reverse(runs), [run]}
+    end
+  end
+
+  defp collect_selection_run(run, []), do: {:cont, [run]}
+  defp collect_selection_run(run, runs), do: {:cont, Enum.reverse(runs), [run]}
+
+  # Preserve explicit positioning around complex graphemes, whose terminal
+  # width can differ from the surface's first-codepoint width estimate.
+  defp selection_run_width("", width), do: width
+
+  defp selection_run_width(<<char, rest::binary>>, width) when char in 32..126,
+    do: selection_run_width(rest, width + 1)
+
+  defp selection_run_width(text, width) do
+    case String.next_grapheme(text) do
+      {<<codepoint::utf8>>, rest} ->
+        case BackBreeze.Ucwidth.width_codepoint(codepoint) do
+          cells when cells in [1, 2] -> selection_run_width(rest, width + cells)
+          _ -> :complex
+        end
+
+      _ ->
+        :complex
+    end
+  end
+
+  defp coalesce_selection_row([]), do: []
+  defp coalesce_selection_row([{row, col, content, _}]), do: [{row, col, content}]
+
+  defp coalesce_selection_row(runs) do
+    {prefix, [{last_row, last_col, last_content, _}]} = Enum.split(runs, length(runs) - 1)
+    {row, col, _, _} = hd(prefix)
+    content = prefix |> Enum.map(&elem(&1, 2)) |> IO.iodata_to_binary()
+    [{row, col, content}, {last_row, last_col, last_content}]
+  end
+
+  defp inverse_text(text, style),
+    do: inverse_open(style) <> text <> Termite.Style.reset_code()
+
+  defp inverse_open(style) do
     ansi =
       Enum.reduce(style, Termite.Style.ansi256(), fn
         {:foreground_color, color}, acc when not is_nil(color) ->
@@ -292,8 +371,7 @@ defmodule Breeze.VTerm.Implicit do
 
     ansi = if Map.get(style, :reverse, false), do: ansi, else: Termite.Style.reverse(ansi)
 
-    Termite.Style.reset_code() <>
-      Termite.Style.open_code(ansi) <> text <> Termite.Style.reset_code()
+    Termite.Style.reset_code() <> Termite.Style.open_code(ansi)
   end
 
   defp copy_notice_overlays(box, %{copy_notice: count} = state, ctx) when not is_nil(count) do
