@@ -190,7 +190,7 @@ defmodule Breeze.VTerm.ImplicitTest do
         pinned_bottom: false
       })
 
-    assert {{:change, %{input: "a"}}, state} =
+    assert {{:change, %{input: "a"}}, state, capture_mouse: false} =
              Implicit.handle_event(:ignore, %{"key" => "a", "element" => viewport(4, 12)}, state)
 
     assert state.offset_y == 8
@@ -228,7 +228,9 @@ defmodule Breeze.VTerm.ImplicitTest do
       assert cursor_visible?(state, now)
     end
 
-    {{:change, _}, updated} = Implicit.handle_event(nil, %{"key" => "x"}, state)
+    {{:change, _}, updated, capture_mouse: false} =
+      Implicit.handle_event(nil, %{"key" => "x"}, state)
+
     assert cursor_visible?(updated, 20_500)
   end
 
