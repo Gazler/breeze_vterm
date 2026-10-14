@@ -100,6 +100,87 @@ defmodule Breeze.VTerm.SelectionTest do
     assert Selection.highlights(surface, {1, 0}, {1, 7}, 0, 2, 8) == []
   end
 
+  test "cached highlights distinguish edited branches, bounds, styles and viewport clipping" do
+    original = Surface.new(cols: 8, rows: 1)
+    red = Surface.write(original, "\e[31ma界bc")
+    green = Surface.write(original, "\e[32mx語yz")
+    assert {red.id, red.version} == {green.id, green.version}
+
+    for _ <- 1..2 do
+      assert Selection.highlights(red, {0, 0}, {0, 7}, 0, 1, 8) ==
+               [{0, 0, "a界bc", %{foreground_color: 1}}]
+
+      assert Selection.highlights(green, {0, 0}, {0, 7}, 0, 1, 8) ==
+               [{0, 0, "x語yz", %{foreground_color: 2}}]
+
+      assert Selection.highlights(red, {0, 0}, {0, 7}, 0, 1, 2) ==
+               [{0, 0, "a ", %{foreground_color: 1}}]
+
+      assert Selection.highlights(red, {0, 2}, {0, 3}, 0, 1, 8) ==
+               [{0, 1, "界b", %{foreground_color: 1}}]
+    end
+  end
+
+  test "coalesced selection overlays preserve styles, wide cells and the final cursor" do
+    source =
+      "\e[31ma界\e[1;32mbc\e[0;7;34mde\e[0m\r\n" <>
+        "\e[3;38;2;1;2;3mx\e[0;44my\e[0mz"
+
+    surface = Surface.new(cols: 10, rows: 2) |> Surface.write(source)
+    {:ok, state, _} = init_selectable(surface)
+    state = %{state | selection: %{anchor: {0, 0}, head: {1, 9}, moved?: true, width: 10}}
+    box = %BackBreeze.Box{content: "", style: %BackBreeze.Style{}}
+
+    for theme <- [nil, Breeze.Theme.builtin(:gruvbox)] do
+      {:ok, _, overlays: overlays} =
+        Breeze.VTerm.Implicit.animate(:root, box, [], state, %{
+          layout: %{left: 0, top: 0, width: 10, height: 2},
+          theme: theme,
+          now: 0
+        })
+
+      highlights = Enum.filter(overlays, & &1.visible?)
+      assert length(highlights) == 4
+      assert Enum.map(highlights, &{&1.x, &1.y}) == [{0, 0}, {5, 0}, {0, 1}, {2, 1}]
+
+      painted =
+        Surface.new(cols: 10, rows: 2)
+        |> Surface.write(Breeze.TerminalOverlay.render_overlays(highlights))
+
+      assert painted.cursor == %{row: 1, col: 2}
+
+      for {original_row, painted_row} <- Enum.zip(surface.screen, painted.screen),
+          {original, actual} <- Enum.zip(original_row, painted_row),
+          original.text != " " do
+        assert actual.text == original.text
+        expected_style = Map.merge(Breeze.Theme.default_style(theme), original.style)
+
+        for key <- [:foreground_color, :background_color, :bold, :italic],
+            do: assert(Map.get(actual.style, key) == Map.get(expected_style, key))
+
+        assert Map.get(actual.style, :reverse, false) ==
+                 not Map.get(original.style, :reverse, false)
+      end
+    end
+  end
+
+  test "coalescing retains cursor positioning around zero-width and complex text" do
+    for text <- ["\u0301", "☀️"] do
+      surface = Surface.new(cols: 10, rows: 1) |> Surface.write(text <> "\e[31ma\e[32mb\e[34mc")
+      {:ok, state, _} = init_selectable(surface)
+      state = %{state | selection: %{anchor: {0, 0}, head: {0, 9}, moved?: true, width: 10}}
+      box = %BackBreeze.Box{content: "", style: %BackBreeze.Style{}}
+
+      {:ok, _, overlays: overlays} =
+        Breeze.VTerm.Implicit.animate(:root, box, [], state, %{
+          layout: %{left: 0, top: 0, width: 10, height: 1},
+          now: 0
+        })
+
+      assert Enum.map(Enum.filter(overlays, & &1.visible?), & &1.x) == [0, 1, 3]
+    end
+  end
+
   test "copy toast is clipped and anchored to the bottom right of the pane" do
     {:ok, state, meta} =
       Breeze.VTerm.Implicit.init(
@@ -269,6 +350,63 @@ defmodule Breeze.VTerm.SelectionTest do
       })
 
     assert cursor.visible?
+  end
+
+  test "compact snapshots retain selection behavior without transferring scrollback" do
+    surface =
+      Surface.new(cols: 120, rows: 30)
+      |> Surface.write(Enum.map_join(1..90, "\r\n", &"\e[31mrow #{&1}\e[0m 界 text"))
+
+    {:ok, pid} =
+      Breeze.ChildServer.start(
+        view: View,
+        start_opts: [owner: self(), selectable: true, surface: surface]
+      )
+
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+    {:ok, _, _, [initial]} = Breeze.ChildServer.render_snapshot(pid, focused: "terminal")
+    %{left: left, top: top} = initial.layout
+    mouse(pid, "press", left + 1, top + 1)
+    mouse(pid, "move", left + 3, top)
+    mouse(pid, "release", left + 3, top)
+
+    {:ok, full_acc, _, [full]} = Breeze.ChildServer.render_snapshot(pid, focused: "terminal")
+
+    {:ok, compact_acc, _, [compact]} =
+      Breeze.ChildServer.render_snapshot(pid, focused: "terminal", compact_snapshot: true)
+
+    assert Map.has_key?(full_acc, :input_routing_signature)
+    refute Map.has_key?(compact_acc, :input_routing_signature)
+    refute Enum.any?(compact_acc.elements, fn {_, flags} -> flags[:"terminal-surface"] end)
+    refute match?(%Surface{}, compact.state.surface)
+    assert :erts_debug.flat_size(compact) < div(:erts_debug.flat_size(full), 10)
+
+    box = %BackBreeze.Box{content: "", style: %BackBreeze.Style{}}
+    ctx = %{layout: full.layout, now: 0}
+
+    assert Breeze.VTerm.Implicit.animate(:root, box, [], compact.state, ctx) ==
+             Breeze.VTerm.Implicit.animate(:root, box, [], full.state, ctx)
+
+    {_, state} = :sys.get_state(pid).implicit_state["terminal"]
+    assert state.surface == surface
+    selection = state.selection
+    expected = Selection.text(surface, selection.anchor, selection.head, selection.width)
+
+    Breeze.ChildServer.dispatch_input(pid, %{
+      "mouse" => %{"button" => "right", "action" => "press", "x" => left, "y" => top}
+    })
+
+    assert_receive {:terminal_event, %{copy: ^expected}}
+
+    {:ok, inspected_acc, _, [inspected]} =
+      Breeze.ChildServer.render_snapshot(pid,
+        focused: "terminal",
+        compact_snapshot: true,
+        render_tree?: true
+      )
+
+    assert inspected.state.surface == surface
+    assert Map.has_key?(inspected_acc, :input_routing_signature)
   end
 
   test "dragging at the top scrolls upward and extends the copied selection" do

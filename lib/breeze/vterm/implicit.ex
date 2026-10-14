@@ -4,8 +4,7 @@ defmodule Breeze.VTerm.Implicit do
   alias Breeze.Implicit.Common
   alias Breeze.Theme
   alias Breeze.Viewport
-  alias Breeze.VTerm.Surface
-  alias Breeze.VTerm.Selection
+  alias Breeze.VTerm.{Selection, SelectionOverlay, Surface}
 
   def init(_children, root_attrs, last_state) do
     surface = Map.get(root_attrs, :"terminal-surface")
@@ -61,6 +60,18 @@ defmodule Breeze.VTerm.Implicit do
   end
 
   def clear_selection(state), do: Map.put(state, :selection, nil)
+
+  # Keep the editable surface in the view process; the compositor only needs
+  # visible selection runs and cursor flags.
+  def animation_state(%{surface: %Surface{} = surface} = state, layout) do
+    viewport = Viewport.from_dimensions(layout)
+
+    state
+    |> Map.put(:selection_highlights, selection_highlights(state, viewport))
+    |> Map.put(:surface, %{cols: surface.cols, cursor_visible?: surface.cursor_visible?})
+  end
+
+  def animation_state(state, _layout), do: state
 
   def handle_event(
         _,
@@ -243,78 +254,47 @@ defmodule Breeze.VTerm.Implicit do
 
   defp selection_overlays(
          box,
-         %{selection: %{moved?: true} = selection, surface: surface} = state,
+         %{selection: %{moved?: true}} = state,
          ctx
        ) do
     viewport = Viewport.from_dimensions(ctx[:layout])
     offset = effective_offset_y(state, viewport)
-    theme = Map.get(ctx, :theme)
-    defaults = Theme.default_style(theme)
+    defaults = Theme.default_style(Map.get(ctx, :theme))
 
-    Selection.highlights(
-      surface,
-      selection.anchor,
-      selection.head,
-      offset,
-      viewport.viewport_height,
-      min(selection.width, viewport.viewport_width || surface.cols)
-    )
-    |> Enum.map(fn {row, col, text, style} ->
-      %{
-        x: viewport.left + content_left_offset(box) + col,
-        y: viewport.top + content_top_offset(box) + row - offset,
-        content: inverse_text(text, Map.merge(defaults, style)),
-        visible?: true
-      }
-    end)
+    origin =
+      {viewport.left + content_left_offset(box), viewport.top + content_top_offset(box) - offset}
+
+    state
+    |> Map.get_lazy(:selection_highlights, fn -> selection_highlights(state, viewport) end)
+    |> SelectionOverlay.render(defaults, origin)
   end
 
   defp selection_overlays(_, _, _), do: []
 
-  defp inverse_text(text, style) do
-    ansi =
-      Enum.reduce(style, Termite.Style.ansi256(), fn
-        {:foreground_color, color}, acc when not is_nil(color) ->
-          Termite.Style.foreground(acc, color)
-
-        {:background_color, color}, acc when not is_nil(color) ->
-          Termite.Style.background(acc, color)
-
-        {:bold, true}, acc ->
-          Termite.Style.bold(acc)
-
-        {:italic, true}, acc ->
-          Termite.Style.italic(acc)
-
-        _, acc ->
-          acc
-      end)
-
-    ansi = if Map.get(style, :reverse, false), do: ansi, else: Termite.Style.reverse(ansi)
-
-    Termite.Style.reset_code() <>
-      Termite.Style.open_code(ansi) <> text <> Termite.Style.reset_code()
+  defp selection_highlights(
+         %{selection: %{moved?: true} = selection, surface: surface} = state,
+         viewport
+       ) do
+    Selection.highlights(
+      surface,
+      selection.anchor,
+      selection.head,
+      effective_offset_y(state, viewport),
+      viewport.viewport_height,
+      min(selection.width, viewport.viewport_width || surface.cols)
+    )
   end
+
+  defp selection_highlights(_, _), do: []
 
   defp copy_notice_overlays(box, %{copy_notice: count} = state, ctx) when not is_nil(count) do
     viewport = Viewport.from_dimensions(ctx[:layout])
     width = min(viewport.viewport_width || 0, state.cols || viewport.viewport_width || 0)
     height = min(viewport.viewport_height, state.rows || viewport.viewport_height)
+    defaults = Theme.default_style(Map.get(ctx, :theme))
+    origin = {viewport.left + content_left_offset(box), viewport.top + content_top_offset(box)}
 
-    if width > 0 and height > 0 do
-      text = String.slice(" Copied #{count} chars ", 0, width)
-
-      [
-        %{
-          x: viewport.left + content_left_offset(box) + width - String.length(text),
-          y: viewport.top + content_top_offset(box) + height - 1,
-          content: inverse_text(text, Theme.default_style(Map.get(ctx, :theme))),
-          visible?: true
-        }
-      ]
-    else
-      []
-    end
+    SelectionOverlay.copy_notice(count, defaults, origin, {width, height})
   end
 
   defp copy_notice_overlays(_, _, _), do: []

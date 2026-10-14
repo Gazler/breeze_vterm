@@ -26,8 +26,7 @@ defmodule Breeze.VTerm.Selection do
           non_neg_integer() | nil
         ) :: [segment()]
   def segments(surface, anchor, head, first_row \\ 0, count \\ nil, width \\ nil) do
-    cell_segments(surface, anchor, head, first_row, count, width)
-    |> Enum.map(fn {row, col, cells} -> {row, col, Enum.map_join(cells, & &1.text)} end)
+    selected_rows(surface, anchor, head, first_row, count, width, &copy_row/5)
   end
 
   # Styled runs use the same coordinates and omit trailing blank cells.
@@ -41,35 +40,59 @@ defmodule Breeze.VTerm.Selection do
         ) ::
           [highlight()]
   def highlights(surface, anchor, head, first_row, count, width) do
-    cell_segments(surface, anchor, head, first_row, count, width, true)
-    |> Enum.flat_map(fn {row, left, cells} ->
-      cells
-      |> Enum.with_index(left)
-      |> Enum.reduce([], fn {cell, col}, acc ->
-        if cell.text == "" do
-          acc
-        else
-          end_col = col + BackBreeze.Ucwidth.width(cell.text)
+    selected_rows(surface, anchor, head, first_row, count, width, &highlight_row/5)
+  end
 
-          case acc do
-            [{^row, start, text, style, ^col} | rest] when style == cell.style ->
-              [{row, start, text <> cell.text, style, end_col} | rest]
+  defp copy_row(row, cells, left, right, width) do
+    case selected_cells(cells, left, right, width, false) do
+      {left, [_ | _] = selected} -> [{row, left, Enum.map_join(selected, & &1.text)}]
+      _ -> []
+    end
+  end
 
-            _ ->
-              [{row, col, cell.text, cell.style, end_col} | acc]
-          end
-        end
-      end)
-      |> Enum.reverse()
-      |> Enum.map(fn {row, col, text, style, _} -> {row, col, text, style} end)
+  defp highlight_row(row, cells, left, right, width) do
+    # Reuse unchanged rows when scrolling or when Breeze requests the same
+    # decorations during layout and painting. Key by content, not surface
+    # id/version: independently edited branches can share those identifiers.
+    BackBreeze.RenderCache.fetch_stable({__MODULE__, cells, left, right, width}, fn ->
+      {left, selected} = selected_cells(cells, left, right, width, true)
+      highlight_runs(selected, left, [])
+    end)
+    |> Enum.map(fn {col, text, style} -> {row, col, text, style} end)
+  end
+
+  defp highlight_runs([], _col, runs) do
+    runs
+    |> Enum.reverse()
+    |> Enum.map(fn {col, chunks, style, _} ->
+      {col, chunks |> Enum.reverse() |> IO.iodata_to_binary(), style}
     end)
   end
 
-  defp cell_segments(surface, anchor, head, first_row, count, width, trim_padding? \\ false) do
+  defp highlight_runs([%{text: ""} | cells], col, runs),
+    do: highlight_runs(cells, col + 1, runs)
+
+  defp highlight_runs([cell | cells], col, runs) do
+    end_col = col + cell_width(cell.text)
+
+    runs =
+      case runs do
+        [{start, chunks, style, ^col} | rest] when style == cell.style ->
+          [{start, [cell.text | chunks], style, end_col} | rest]
+
+        _ ->
+          [{col, [cell.text], cell.style, end_col} | runs]
+      end
+
+    highlight_runs(cells, col + 1, runs)
+  end
+
+  defp selected_rows(surface, anchor, head, first_row, count, width, fun) do
     width = min(width || surface.cols, surface.cols)
-    {start, finish} = Enum.min_max([clamp(surface, anchor), clamp(surface, head)])
-    {start_row, start_col} = start
-    {end_row, end_col} = finish
+
+    {{start_row, start_col}, {end_row, end_col}} =
+      Enum.min_max([clamp(surface, anchor), clamp(surface, head)])
+
     first = max(start_row, first_row)
     last = min(end_row, first_row + (count || Surface.line_count(surface)) - 1)
 
@@ -82,35 +105,46 @@ defmodule Breeze.VTerm.Selection do
       |> Enum.flat_map(fn {cells, row} ->
         left = if row == start_row, do: start_col, else: 0
         right = min(if(row == end_row, do: end_col, else: surface.cols - 1), width - 1)
-        right = if trim_padding?, do: min(right, text_end(cells)), else: right
-        left = if left > 0 and match?(%{text: ""}, Enum.at(cells, left)), do: left - 1, else: left
-
-        if left > right do
-          []
-        else
-          selected_cells =
-            cells
-            |> Enum.slice(left, right - left + 1)
-            |> Enum.with_index(left)
-            |> Enum.map(fn {cell, col} ->
-              if col + BackBreeze.Ucwidth.width(cell.text) > width,
-                do: %{cell | text: " "},
-                else: cell
-            end)
-
-          [{row, left, selected_cells}]
-        end
+        fun.(row, cells, left, right, width)
       end)
     end
   end
 
-  defp text_end(cells) do
-    cells
-    |> Enum.with_index()
-    |> Enum.reduce(-1, fn {cell, col}, last ->
-      if String.trim(cell.text) == "", do: last, else: col
-    end)
+  defp selected_cells(cells, left, right, width, trim_padding?) do
+    right = if trim_padding?, do: min(right, text_end(cells, 0, -1)), else: right
+    left = if left > 0 and match?(%{text: ""}, Enum.at(cells, left)), do: left - 1, else: left
+
+    selected =
+      if left > right do
+        []
+      else
+        cells
+        |> Enum.slice(left, right - left + 1)
+        |> clip_cells(left, width)
+      end
+
+    {left, selected}
   end
+
+  defp clip_cells([], _, _), do: []
+
+  defp clip_cells([cell | cells], col, width) do
+    clipped = if col + cell_width(cell.text) > width, do: %{cell | text: " "}, else: cell
+    [clipped | clip_cells(cells, col + 1, width)]
+  end
+
+  defp text_end([], _, last), do: last
+
+  defp text_end([cell | cells], col, last),
+    do: text_end(cells, col + 1, if(blank?(cell.text), do: last, else: col))
+
+  defp blank?(text) when text in ["", " "], do: true
+  defp blank?(<<char>>) when char > 32 and char < 127, do: false
+  defp blank?(text), do: String.trim(text) == ""
+
+  defp cell_width(<<char>>) when char >= 32 and char < 127, do: 1
+  defp cell_width(""), do: 0
+  defp cell_width(text), do: BackBreeze.Ucwidth.width(text)
 
   defp clamp(surface, {row, col}) do
     {row |> max(0) |> min(Surface.line_count(surface) - 1),
