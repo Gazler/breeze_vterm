@@ -19,7 +19,7 @@ defmodule BreezeVTerm.MixProject do
 
   defp deps do
     [
-      {:breeze, "~> 0.5.3"},
+      {:breeze, git: "https://github.com/Gazler/breeze.git", branch: "master"},
       {:file_system, "~> 1.1", only: :dev}
     ]
   end
