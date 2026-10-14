@@ -156,7 +156,7 @@ defmodule Breeze.VTerm.Implicit do
   end
 
   def handle_event(_, event, state) do
-    case Surface.input(event) do
+    case Surface.input(Map.get(state, :surface), event) do
       bytes when is_binary(bytes) ->
         {{:change, %{input: bytes, event: event}}, pin_bottom(clear_selection(state), event),
          capture_mouse: false}
@@ -218,7 +218,11 @@ defmodule Breeze.VTerm.Implicit do
     col = Map.get(cursor, :col, 0)
     char = Map.get(cursor, :char, " ")
     visible_row = Map.get(state, :scrollback_rows, 0) + row - offset_y
-    cursor_visible? = visible_row >= 0 and visible_row < viewport.viewport_height
+
+    cursor_visible? =
+      visible_row >= 0 and visible_row < viewport.viewport_height and
+        Map.get(Map.get(state, :surface) || %{}, :cursor_visible?, true)
+
     overlay_row = max(visible_row, 0)
 
     %{

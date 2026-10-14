@@ -37,10 +37,10 @@ defmodule Breeze.VTerm.LineEditingTest do
 
   test "wide characters shift as cells and clipped halves become blanks" do
     for {input, expected} <- [
-          {"ab界cd\e[5D\e[@X", "aXb界c"},
-          {"abcd界\e[5D\e[@X", "aXbcd "},
-          {"a界bcd\e[5D\e[P", "a bcd "},
-          {"a界bcd\e[4D\e[@X", "a X bc"}
+          {"ab界cd\e[2G\e[@X", "aXb界c"},
+          {"abcd界\e[2G\e[@X", "aXbcd "},
+          {"a界bcd\e[2G\e[P", "a bcd "},
+          {"a界bcd\e[3G\e[@X", "a X bc"}
         ] do
       surface = Surface.new(cols: 6, rows: 1) |> Surface.write(input)
       assert Surface.lines(surface) == [expected]

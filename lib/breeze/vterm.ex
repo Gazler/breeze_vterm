@@ -14,5 +14,6 @@ defmodule Breeze.VTerm do
   defdelegate write(surface, bytes), to: Surface
   defdelegate resize(surface, cols, rows), to: Surface
   defdelegate input(event), to: Surface
+  defdelegate input(surface, event), to: Surface
   defdelegate virtual_text(surface), to: Surface
 end
