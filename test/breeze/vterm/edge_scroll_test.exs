@@ -55,8 +55,15 @@ defmodule Breeze.VTerm.EdgeScrollTest do
           end)
 
       Breeze.ChildServer.render_snapshot(pid, focused: "terminal")
-      edge_row = if direction == :up, do: 0, else: 5
+      edge_row = if direction == :up, do: 0, else: state(pid).__element__.viewport_height - 1
       mouse(pid, "press", 2, 2)
+
+      if direction == :down do
+        mouse(pid, "move", 0, surface.rows - 1)
+        assert state(pid).offset_y == 0
+        assert state(pid).edge_scroll == nil
+      end
+
       mouse(pid, "move", 0, edge_row)
       initial = state(pid)
       assert initial.edge_scroll
@@ -127,7 +134,8 @@ defmodule Breeze.VTerm.EdgeScrollTest do
   end
 
   test "reinitializing preserves valid timers and cancels invalidated or disabled scrolling" do
-    surface = Surface.new(cols: 8, rows: 2) |> Surface.write("hello")
+    initial = Surface.new(cols: 8, rows: 2)
+    surface = Surface.write(initial, "hello")
 
     attrs = %{
       id: "terminal",
@@ -138,6 +146,7 @@ defmodule Breeze.VTerm.EdgeScrollTest do
 
     changes = [
       output: Map.put(attrs, :"terminal-surface", Surface.write(surface, "!")),
+      branch: Map.put(attrs, :"terminal-surface", Surface.write(initial, "world")),
       resize: Map.put(attrs, :"terminal-surface", Surface.resize(surface, 10, 3)),
       selection_disabled: Map.put(attrs, :"terminal-selectable", false),
       autoscroll_disabled: Map.put(attrs, :"terminal-selection-autoscroll", false)

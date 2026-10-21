@@ -19,6 +19,106 @@ defmodule Breeze.VTerm.SelectionTest do
     assert Selection.text(surface, {-2, -4}, {99, 99}) == "one\ntwo\nthree"
   end
 
+  test "mouse selection reaches all visible buffer rows in a pane taller than the screen" do
+    surface = Surface.new(cols: 8, rows: 2) |> Surface.write("one\r\ntwo\r\nthree\r\nfour")
+
+    for height <- [4, 6], row <- [3, 99] do
+      {:ok, state, _} = init_selectable(surface)
+
+      event = %{
+        "mouse" => %{"button" => "left", "action" => "press"},
+        "row" => row,
+        "col" => 0,
+        "element" => %{width: 8, height: height, content_height: 4}
+      }
+
+      {{:change, %{selection: :start}}, state, capture_mouse: true} =
+        Breeze.VTerm.Implicit.handle_event(nil, event, state)
+
+      assert state.selection.anchor == {3, 0}
+      release = event |> put_in(["mouse", "action"], "release") |> Map.put("col", 3)
+
+      {:noreply, state, capture_mouse: false} =
+        Breeze.VTerm.Implicit.handle_event(nil, release, state)
+
+      assert state.selection.head == {3, 3}
+
+      assert {{:change, %{copy: "four"}}, _} =
+               Breeze.VTerm.Implicit.handle_event(
+                 nil,
+                 %{"mouse" => %{"button" => "right", "action" => "press"}},
+                 state
+               )
+    end
+  end
+
+  test "selection scrolling starts at the visible buffer edge in a tall pane" do
+    surface =
+      Surface.new(cols: 8, rows: 2)
+      |> Surface.write("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix")
+
+    {:ok, state, _} = init_selectable(surface, %{offset_y: 0, pinned_bottom: false})
+
+    event = %{
+      "mouse" => %{"button" => "left", "action" => "press"},
+      "row" => 0,
+      "col" => 0,
+      "element" => %{width: 8, height: 4, content_height: 6}
+    }
+
+    {{:change, %{selection: :start}}, state, capture_mouse: true} =
+      Breeze.VTerm.Implicit.handle_event(nil, event, state)
+
+    drag = event |> put_in(["mouse", "action"], "move") |> Map.put("col", 3)
+
+    Enum.reduce([{1, 0, 1}, {2, 0, 2}, {3, 1, 4}, {99, 2, 5}, {99, 2, 5}], state, fn
+      {row, offset, head_row}, state ->
+        {:noreply, state, consumed: true} =
+          Breeze.VTerm.Implicit.handle_event(nil, Map.put(drag, "row", row), state)
+
+        assert state.offset_y == offset
+        assert state.selection.head == {head_row, 3}
+        assert state.selection.anchor == {0, 0}
+        state
+    end)
+  end
+
+  test "equal-version surface branches invalidate selection before copying" do
+    initial = Surface.new(cols: 8, rows: 2)
+    surface = Surface.write(initial, "abc")
+    replacement = Surface.write(initial, "xyz")
+    assert surface.id == replacement.id
+    assert surface.version == replacement.version
+    {:ok, state, _} = init_selectable(surface)
+
+    event = %{
+      "mouse" => %{"button" => "left", "action" => "press"},
+      "row" => 0,
+      "col" => 0,
+      "element" => %{width: 8, height: 2}
+    }
+
+    {{:change, %{selection: :start}}, state, capture_mouse: true} =
+      Breeze.VTerm.Implicit.handle_event(nil, event, state)
+
+    release = event |> put_in(["mouse", "action"], "release") |> Map.put("col", 2)
+
+    {:noreply, state, capture_mouse: false} =
+      Breeze.VTerm.Implicit.handle_event(nil, release, state)
+
+    copy = %{"mouse" => %{"button" => "right", "action" => "press"}}
+    assert {{:change, %{copy: "abc"}}, _} = Breeze.VTerm.Implicit.handle_event(nil, copy, state)
+
+    {:ok, preserved, _} = init_selectable(surface, state)
+    assert preserved.selection == state.selection
+
+    {:ok, replaced, _} = init_selectable(replacement, state)
+    assert replaced.selection == nil
+
+    assert {:noreply, ^replaced, capture_mouse: false} =
+             Breeze.VTerm.Implicit.handle_event(nil, copy, replaced)
+  end
+
   test "highlighting clips to the viewport and output invalidates the selection" do
     surface = Surface.new(cols: 8, rows: 2) |> Surface.write("abcdefgh\r\nijklmnop")
     {:ok, state, _} = init_selectable(surface)

@@ -46,6 +46,24 @@ defmodule Breeze.VTerm.LibvtermPortTest do
     assert Surface.lines(Surface.write(surface, "\e[?7hXY")) == ["abcX", "Y   "]
   end
 
+  test "restoring an unchanged cursor preserves delayed wrapping" do
+    for {save, restore} <- [{"\e7", "\e8"}, {"\e[s", "\e[u"}, {"\e[?1048h", "\e[?1048l"}] do
+      surface = Surface.new(cols: 4, rows: 2) |> Surface.write("abcd" <> save <> restore)
+
+      assert surface.wrap_pending?
+      assert surface.cursor == %{row: 0, col: 3}
+      assert Surface.lines(Surface.write(surface, "X")) == ["abcd", "X   "]
+
+      moved = Surface.write(surface, "\r\e[4G" <> restore)
+      refute moved.wrap_pending?
+      assert Surface.lines(Surface.write(moved, "X")) == ["abcX", "    "]
+
+      moved = Surface.new(cols: 4, rows: 2) |> Surface.write("ab" <> save <> "cd" <> restore)
+      refute moved.wrap_pending?
+      assert Surface.lines(Surface.write(moved, "X")) == ["abXd", "    "]
+    end
+  end
+
   test "tab moves over existing content and stops at the edge" do
     surface = Surface.new(cols: 12, rows: 2) |> Surface.write("abcdefghijkl\r\tX\tY")
     assert Surface.lines(surface) == ["abcdefghXjkY", "            "]

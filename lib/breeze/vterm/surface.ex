@@ -795,7 +795,8 @@ defmodule Breeze.VTerm.Surface do
         cursor_visible?: surface.saved_cursor_visible?
     }
 
-    put_cursor(surface, row, col)
+    restored = put_cursor(surface, row, col)
+    %{restored | wrap_pending?: surface.wrap_pending? and restored.cursor == surface.cursor}
   end
 
   defp restore_cursor(surface), do: surface

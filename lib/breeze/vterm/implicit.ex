@@ -64,7 +64,7 @@ defmodule Breeze.VTerm.Implicit do
 
   defp restore_selection(state, surface, selectable?, autoscroll?) do
     if selectable? and not is_nil(state[:selection]) and
-         surface_signature(surface) == surface_signature(state[:surface]) do
+         surface == state[:surface] do
       if autoscroll?,
         do: Map.put_new(state, :edge_scroll, nil),
         else: stop_edge_scroll(state)
@@ -358,7 +358,7 @@ defmodule Breeze.VTerm.Implicit do
   defp scroll_selection(state, %{"mouse" => %{"action" => "move"}, "row" => row} = event)
        when is_integer(row) do
     viewport = Viewport.from_dimensions(event["element"])
-    height = min(viewport.viewport_height, state.surface.rows)
+    height = visible_buffer_height(state, viewport)
 
     direction =
       cond do
@@ -438,7 +438,7 @@ defmodule Breeze.VTerm.Implicit do
     row =
       (event["row"] || 0)
       |> max(0)
-      |> min(max(min(viewport.viewport_height, state.surface.rows) - 1, 0))
+      |> min(max(visible_buffer_height(state, viewport) - 1, 0))
 
     col =
       (event["col"] || 0)
@@ -448,10 +448,10 @@ defmodule Breeze.VTerm.Implicit do
     {row + effective_offset_y(state, viewport), col}
   end
 
-  defp surface_signature(%Surface{} = surface),
-    do: {surface.id, surface.version, surface.cols, surface.rows}
-
-  defp surface_signature(_), do: nil
+  defp visible_buffer_height(state, viewport) do
+    remaining_rows = Surface.line_count(state.surface) - effective_offset_y(state, viewport)
+    max(min(viewport.viewport_height, remaining_rows), 0)
+  end
 
   defp default_cursor, do: %{row: 0, col: 0, char: " "}
 
