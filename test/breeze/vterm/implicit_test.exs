@@ -190,7 +190,7 @@ defmodule Breeze.VTerm.ImplicitTest do
         pinned_bottom: false
       })
 
-    assert {{:change, %{input: "a"}}, state} =
+    assert {{:change, %{input: "a"}}, state, capture_mouse: false} =
              Implicit.handle_event(:ignore, %{"key" => "a", "element" => viewport(4, 12)}, state)
 
     assert state.offset_y == 8
@@ -228,7 +228,9 @@ defmodule Breeze.VTerm.ImplicitTest do
       assert cursor_visible?(state, now)
     end
 
-    {{:change, _}, updated} = Implicit.handle_event(nil, %{"key" => "x"}, state)
+    {{:change, _}, updated, capture_mouse: false} =
+      Implicit.handle_event(nil, %{"key" => "x"}, state)
+
     assert cursor_visible?(updated, 20_500)
   end
 
@@ -237,6 +239,29 @@ defmodule Breeze.VTerm.ImplicitTest do
     assert meta[:rerender_every] == 500
     assert cursor_visible?(state, 1000)
     refute cursor_visible?(state, 1500)
+  end
+
+  test "terminal cursor visibility controls the overlay" do
+    surface = Breeze.VTerm.Surface.new() |> Breeze.VTerm.Surface.write("\e[?25l")
+
+    {:ok, state, _} =
+      Implicit.init([], %{:"terminal-surface" => surface, :"cursor-blink" => false}, %{})
+
+    refute cursor_visible?(state, 0)
+    surface = Breeze.VTerm.Surface.write(surface, "\e[?25h")
+
+    {:ok, state, _} =
+      Implicit.init([], %{:"terminal-surface" => surface, :"cursor-blink" => false}, state)
+
+    assert cursor_visible?(state, 0)
+  end
+
+  test "terminal application cursor mode affects emitted key input" do
+    surface = Breeze.VTerm.Surface.new() |> Breeze.VTerm.Surface.write("\e[?1h")
+    {:ok, state, _} = Implicit.init([], %{:"terminal-surface" => surface}, %{})
+
+    assert {{:change, %{input: "\eOA"}}, _, capture_mouse: false} =
+             Implicit.handle_event(nil, %{"key" => "ArrowUp"}, state)
   end
 
   defp cursor_visible?(state, now) do
